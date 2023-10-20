@@ -1,0 +1,3418 @@
+
+# Provides a quick and dirty way for a Site's Auth subsystem to squirrel away validated user information.  Its likely this
+# information has some time-to-live, and thus we can keep it around for a bit rather than force unnecessary logins.  The Auth
+# API includes an "am I still authenticated" endpoint which the Site Auth is free to implement any way desired.
+# This utility is provided here as a convenience only.
+
+import logging
+import os
+
+
+class AuthStore():
+
+    def storeAuthProperties(self, site: str="", props: dict={}) -> bool:
+        path = os.path.expanduser('~') + "/.lwfm/" + site + "/auth.txt"
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, 'w') as f:
+            for key, value in props.items():
+                f.write('%s = %s\n' % (key, value))
+        return True
+
+
+    def loadAuthProperties(self, site: str="") -> dict:
+        path = os.path.expanduser('~') + "/.lwfm/" + site + "/auth.txt"
+        # Check whether the specified path exists or not
+        isExist = os.path.exists(path)
+        if (not isExist):
+            return None
+        myvars = {}
+        with open(path) as f:
+            name = None
+            for line in f:
+                # We need to be able to have multiline vars for private keys
+                if line.count("=") == 1:
+                    name, var = line.split("=")
+                    name = name.strip()
+                    myvars[name] = var.strip()
+                else:
+                    var = line.strip()
+                    myvars[name] += "\n" + var
+        return myvars
+
+
+
+#************************************************************************************************************************************
+# test
+
+if __name__ == '__main__':
+    logging.basicConfig()
+    logging.getLogger().setLevel(logging.DEBUG)
+    authStore = AuthStore()
+    props = { "a" : "aval", "b" : "bval" }
+    authStore.storeAuthProperties("testSite", props)
+    props = authStore.loadAuthProperties("testSite")
+    logging.info(props)
+
+import logging
+import importlib
+from datetime import datetime, timezone
+import time
+import json
+import requests
+from types import SimpleNamespace
+from pathlib import Path
+import os
+import pickle
+from typing import Callable
+
+from lwfm.base.Site import Site, SiteAuthDriver, SiteRunDriver, SiteRepoDriver
+from lwfm.base.SiteFileRef import FSFileRef, SiteFileRef, RemoteFSFileRef, S3FileRef
+from lwfm.base.JobDefn import JobDefn, RepoOp
+from lwfm.base.JobStatus import JobStatus, JobStatusValues, JobContext
+from lwfm.base.MetaRepo import MetaRepo
+from lwfm.server.JobStatusSentinelClient import JobStatusSentinelClient
+from lwfm.base.JobEventHandler import JobEventHandler
+
+
+from py4dt4d._internal._SecuritySvc import _SecuritySvc
+from py4dt4d._internal._JobSvc import _JobSvc
+from py4dt4d._internal._SimRepoSvc import _SimRepoSvc
+from py4dt4d._internal._PyEngineUtil import _PyEngineUtil
+from py4dt4d._internal._Constants import _Locations, _LocationServers
+from py4dt4d._internal._Constants import _Locations
+from py4dt4d.PyEngine import PyEngine
+from py4dt4d._internal._PyEngineImpl import _PyEngineImpl
+from py4dt4d.Job import JobRunner
+from py4dt4d.ToolRepo import ToolRepo
+from py4dt4d.SimRepo import SimRepo
+
+SERVER = _Locations.PROD_STR.value
+
+LOCAL_COMPUTE_TYPE = "local"
+
+JOB_SET_HANDLER_TYPE = "jobset"
+DATA_HANDLER_TYPE = "data"
+
+DT4D_API = "https://dt4dapi.research.ge.com"
+
+#************************************************************************************************************************************
+
+# the native DT4D status strings mapped to the canonical lwfm terms
+class DT4DJobStatus(JobStatus):
+    def __init__(self, jobContext: JobContext):
+        super(DT4DJobStatus, self).__init__(jobContext)
+        self.setStatusMap({
+            "UNKNOWN"     : JobStatusValues.UNKNOWN,
+            "REQUESTING"  : JobStatusValues.PENDING,
+            "REQUESTED"   : JobStatusValues.PENDING,
+            "SUBMITTED"   : JobStatusValues.PENDING,
+            "DISCOVERED"  : JobStatusValues.PENDING,
+            "PENDING"     : JobStatusValues.PENDING,
+            "RUNNING"     : JobStatusValues.RUNNING,
+            "ANALYSIS"    : JobStatusValues.INFO,
+            "MODIFY"      : JobStatusValues.INFO,
+            "MOVING"      : JobStatusValues.INFO,
+            "MOVED"       : JobStatusValues.INFO,
+            "FINISHED"    : JobStatusValues.FINISHING,
+            "COMPLETED"   : JobStatusValues.COMPLETE,
+            "IMPROPER"    : JobStatusValues.FAILED,
+            "FAILED"      : JobStatusValues.FAILED,
+            "CANCELLED"   : JobStatusValues.CANCELLED,
+            "TIMEOUT"     : JobStatusValues.CANCELLED,
+        })
+
+    def toJSON(self):
+        return self.serialize()
+
+    def serialize(self):
+        out_bytes = pickle.dumps(self, 0)
+        out_str = out_bytes.decode(encoding='ascii')
+        return out_str
+
+    @staticmethod
+    def deserialize(s: str):
+        in_json = json.dumps(s)
+        in_obj = pickle.loads(json.loads(in_json).encode(encoding='ascii'))
+        return in_obj
+
+
+#************************************************************************************************************************************
+# Auth
+
+class DT4DSiteAuthDriver(SiteAuthDriver):
+    def login(self, force: bool=False) -> bool:
+        # login to DT4D
+        if (not self.isAuthCurrent()):
+            _SecuritySvc().freshLogin(SERVER)
+        return True
+
+    def isAuthCurrent(self) -> bool:
+        # DT4D doesn't expose an "is current" endpoint - if you make a call and you're not logged in, you get prompted
+        # so to avoid incessant popping of the dt4d login dialog, do a quick and dirty check on a cached token
+        path = os.path.expanduser('~') + "/dt4d/tokens.txt"
+        if os.path.exists(path):
+            mtime = os.stat(path).st_mtime
+            modified = datetime.fromtimestamp(mtime, tz=timezone.utc)
+            now = datetime.now()
+            delta = now.timestamp() - modified.timestamp()
+            if (delta < 3000):  # TODO: completely arbitrary...
+                return True
+            else:
+                return False
+        else:
+            return False
+
+    # DT4D provides its own local token persistence
+    def writeToStore(self) -> bool:
+        return True
+
+    # DT4D provides its own local token persistence
+    def readFromStore(self) -> bool:
+        return True
+
+
+#************************************************************************************************************************************
+# Run
+
+@JobRunner
+def _runRemoteJob(job, jobId, toolName, toolFile, toolClass, toolArgs, computeType, jobName, setId, timeout=0.5):
+    # Run the tool on the remote computeType.
+    _JobSvc(job).runRemotePyJob(job, toolName, toolFile, toolClass, toolArgs, computeType, "", setId,
+                                jobName, timeout, None, None, jobId)
+
+@JobRunner
+def _job_set_event(job, jobId, toolName, toolFile, toolClass, toolArgs, computeType, waitOnSetId, jobSetNumber, setId, jobName, timeout=0):
+    # Run the tool on the remote computeType.
+    print("Time to register the job: toolName:" + str(toolName) + "|toolFile:" + str(toolFile) + "|toolClass:" + str(toolClass) + "|args:" + str(toolArgs) + "|computeType:" + str(computeType) + "|waitOnSetId:" + str(waitOnSetId) + "|setNum:" + str(jobSetNumber))
+    _JobSvc(job).registerJob(job, toolName, toolFile, toolClass, toolArgs, computeType, "", waitOnSetId, jobSetNumber, jobType="python",
+        setId=setId, jobName=jobName, triggerJobId=jobId)
+
+@JobRunner
+def _data_event(job, jobId, toolName, toolFile, toolClass, toolArgs, computeType, trigger, setId, jobName, timeout=0):
+    # Run the tool on the remote computeType.
+    _JobSvc(job).registerDataTrigger(job, toolName, toolFile, toolClass, toolArgs, computeType, "", trigger, jobType="python",
+                                setId=setId, jobName=jobName, triggerJobId=jobId)
+
+def _unset_job_set_event(self, jobId):
+    # Run the tool on the remote computeType.
+    _PyEngineImpl().removeJobSetTrigger(self, jobId)
+
+def _unset_data_event(self, jobId):
+    # Run the tool on the remote computeType.
+    _PyEngineImpl().removeDataTrigger(self, jobId)
+
+def _getJobStatus(self, jobContext):
+    return _getJobStatusWorker(self, jobContext)
+
+def _getAllJobs(startTime, endTime):
+    statuses = []
+    status_dicts = _queryMostRecentJobStatus(startTime, endTime)
+    for status_dict in status_dicts:
+        context = JobContext()
+        if 'workflowId' in status_dict:
+            context.setId(status_dict['workflowId'])
+        if 'originatorWorkflowId' in status_dict:
+            context.setParentJobId(status_dict['originatorWorkflowId'])
+        if 'parentWorkflowId' in status_dict:
+            context.setOriginJobId(status_dict['parentWorkflowId'])        
+        if 'jobName' in status_dict:
+            context.setName(status_dict['jobName'])
+        if 'computeType' in status_dict:
+            context.setComputeType(status_dict['computeType'])
+        elif 'computeHost' in status_dict:
+            context.setComputeType(status_dict['computeHost'])
+        if 'tenant' in status_dict:
+            context.setGroup(status_dict['tenant'])
+        if 'userSSO' in status_dict:
+            context.setUser(status_dict['userSSO'])
+        context.setSiteName('dt4d')
+        status = DT4DJobStatus(context)
+        status.setReceivedTime(datetime.utcfromtimestamp(status_dict['timestamp']/1000))
+        status.setStatus(status.getStatusMap()[status_dict['status'].upper()])
+        statuses.append(status.serialize())
+    return statuses
+
+def _queryMostRecentJobStatus(startTime, endTime):
+    s = requests.Session()
+    tokenFile = _SecuritySvc().login()
+    location = tokenFile["location"]
+    token = tokenFile["accessToken"]
+    query="?startTimeMs=" + str(startTime) + "&endTimeMs=" + str(endTime)
+    url = _LocationServers.JOB_SVC_MAP.value[location] + "/api/v0/repo/get/runAggregated" + query
+
+    m = s.get(url,
+                  headers={"Authorization":"Bearer " + token, "Content-Type" : "application/json"},
+                  json = {"startTimeMs":str(startTime), "endTimeMs":str(endTime)})
+    if m.status_code == 200:
+        return m.json()
+    else: 
+        logger.error(str(m.content))
+        return []
+
+
+def _getJobStatusWorker(job, jobContext):
+    timeNowMs = int(round(time.time() * 1000))
+    startTimeMs =  timeNowMs - (99999 * 60 * 1000)
+    endTimeMs = timeNowMs + int(round(99999 * 60 * 1000))
+    results = _JobSvc(job).queryJobStatusByJobId(startTimeMs, endTimeMs, jobContext.getNativeId())
+    stat =  _statusProcessor(results, jobContext)
+    # if (stat.getParentJobId() is None):
+    #     stat.setParentJobId("")
+    out = stat.serialize()
+    return out
+
+
+class Struct:
+    def __init__(self, **entries):
+        self.__dict__.update(entries)
+
+def _statusProcessor(results, context):
+    status = DT4DJobStatus(context)
+    currTime = 0
+    currStatus = None
+    for entry in results:
+        x = Struct(**entry)
+        if (x.dt4dReceivedTimestamp > currTime):
+            currTime = x.dt4dReceivedTimestamp
+            currStatus = x.status
+    status.setNativeStatusStr(currStatus)
+    status.getJobContext().setId(context.getId())
+    return status
+
+
+class DT4DSiteRunDriver(SiteRunDriver):
+    def submitJob(self, jdefn: JobDefn, parentContext: JobContext = None) -> JobStatus:
+        context = parentContext
+        if (context is None):
+            context = JobContext()
+        status = DT4DJobStatus(context)
+        if jdefn is None:
+            status.emit("IMPROPER")
+            return status
+
+        # launch the job with DT4D
+        # DT4D moodule path is python [ directory, module, file, class ]
+        modulePath = jdefn.getEntryPoint()
+        modulePathStr = modulePath[1] + "." + modulePath[2]
+
+        nativeId = context.getId()  # default to lwfm id
+        setId = context.getJobSetId()
+        if (jdefn.getComputeType() == LOCAL_COMPUTE_TYPE):
+            # run local dt4d job
+            cls = getattr(importlib.import_module(modulePathStr), modulePath[3])
+            try:
+                # we need the native id
+                jobClass = cls()
+                nativeId = jobClass.getJobId()
+                PyEngine().runLocal(jobClass)
+            except Exception as ex:
+                print("**** DT4DSiteSDriver exception while running local job " + str(ex))
+        else:
+            # run remote dt4d job
+            #nativeId = _PyEngineUtil.generateId()
+            _runRemoteJob(nativeId,
+                          modulePath[0], modulePath[1], modulePath[2],
+                          jdefn.getJobArgs(), jdefn.getComputeType(), jdefn.getName(), setId)
+
+        context.setNativeId(nativeId)
+        #status.setNativeId(nativeId)
+        # At this point the status object we have contains the job's lwfm id and its native id.  it does not however
+        # contain an accurate job status/state string - the job is being launched asynchronously, and therefore that underlying
+        # runtime is going to take the job through its states.  to get the state into lwfm, we need to poll the site.
+        #retval = JobStatusSentinelClient().setTerminalSentinel(context.getId(), context.getParentJobId(), context.getOriginJobId(),
+        #                                                       context.getNativeId(), "dt4d")
+        return status
+
+    def getJobStatus(self, jobContext: JobContext) -> JobStatus:
+        stat =  _getJobStatus(jobContext)
+        status = DT4DJobStatus.deserialize(stat)
+        return status
+
+    def cancelJob(self, nativeJobId: str) -> bool:
+        # not implemented
+        return False
+
+
+    def listComputeTypes(self) -> [str]:
+        computeTypes = PyEngine.listComputeTypes(self)
+        return computeTypes
+
+
+    def setEventHandler(self, jdefn:JobDefn, jeh: JobEventHandler) -> JobEventHandler:
+        context = jeh.getTargetContext()
+        if (context is None):
+            context = JobContext()
+        status = DT4DJobStatus(context)
+        if jeh is None:
+            status.emit("IMPROPER")
+            return status
+
+        # set the handler with DT4D
+        # DT4D moodule path is python [module, file, class ]
+        modulePath = jdefn.getEntryPoint()
+
+        nativeId = _PyEngineUtil.generateId()
+        setId = context.getJobSetId()
+        jobName = jdefn.getName()
+        fireDefn = jeh.getFireDefn()
+        # Getting the handler type.  There are 2 types in dt4d.  jobset handlers will fire when a job set with a specified length
+        # has completed.  data handlers will fire when a file is uploaded with a given metadata set.
+        handlerType = fireDefn[0]
+        if handlerType.lower() == JOB_SET_HANDLER_TYPE:
+            waitOnSetId = fireDefn[1]
+            jobSetNumber = int(fireDefn[2])
+            _job_set_event(nativeId, modulePath[0], modulePath[1], modulePath[2],
+                        jdefn.getJobArgs(), jdefn.getComputeType(), waitOnSetId, jobSetNumber, setId, jobName)
+        elif handlerType.lower() == DATA_HANDLER_TYPE:
+            trigger = fireDefn[1]
+            _data_event(nativeId, modulePath[0], modulePath[1], modulePath[2],
+                        jdefn.getJobArgs(), jdefn.getComputeType(), trigger, setId, jobName)
+        context.setNativeId(nativeId)
+        # At this point the status object we have contains the job's lwfm id and its native id.  it does not however
+        # contain an accurate job status/state string - the job is being launched asynchronously, and therefore that underlying
+        # runtime is going to take the job through its states.  to get the state into lwfm, we need to poll the site.
+        #retval = JobStatusSentinelClient().setTerminalSentinel(context.getId(), context.getParentJobId(), context.getOriginJobId(),
+        #                                                       context.getNativeId(), "dt4d")
+        return status
+
+
+    def unsetEventHandler(self, jeh: JobEventHandler) -> bool:
+        handlerType = jeh.getFireDefn()[0]
+        print("UNSETTING " + handlerType + ": " + jeh.getId())
+        if(handlerType.lower() == JOB_SET_HANDLER_TYPE):
+            _unset_job_set_event(jeh.getId())
+            #_PyEngineImpl.removeJobSetTrigger(self, self, jeh.getId())
+        elif(handlerType.lower() == DATA_HANDLER_TYPE):
+            _unset_data_event(jeh.getId())
+            #_PyEngineImpl.removeDataTrigger(self, self, jeh.getId())
+
+    def listEventHandlers(self) -> [JobEventHandler]:
+        eventHandlers = PyEngine().listRegisteredJobs()
+        eventHandlers.extend(PyEngine().listDataTriggers())
+        return eventHandlers
+        
+    def getJobList(self, startTime: int, endTime: int) -> [JobStatus]:
+        statuses = []
+        serialized_statuses = _getAllJobs(startTime, endTime)
+        for serialized_status in serialized_statuses:
+            status = DT4DJobStatus.deserialize(serialized_status)
+            statuses.append(status)
+        return statuses
+
+
+#************************************************************************************************************************************
+# Repo
+
+@JobRunner
+def repoPut(job, path, metadata={}):
+    return SimRepo(job).put(path, metadata)
+
+@JobRunner
+def repoGet(job, docId, path="", fullPath=False):
+    return SimRepo(job).getByDocId(docId, path, fullPath=fullPath)
+
+@JobRunner
+def repoFindById(job, docId):
+    return SimRepo(job).getMetadataByDocId(docId)
+
+@JobRunner
+def repoFindByMetadata(job, metadata):
+    return SimRepo(job).getMetadataByMetadata(metadata)
+
+def repoGetValues(field, contains, group, metadata, startTime, endTime):
+    s = requests.Session()
+    tokenFile = _SecuritySvc().login()
+    location = tokenFile["location"]
+    token = tokenFile["accessToken"]
+    #overriding group for now and using the group the user is logged into
+    print("GROUP: " + str(group))
+    group = tokenFile["userGroup"]
+    print("GROUP: " + str(group))
+    query="?startTimeMs=" + str(startTime) + "&endTimeMs=" + str(endTime)
+    url = _LocationServers.JOB_SVC_MAP.value[location] + "/api/v0/search/get/fieldValues"
+    values = s.post(url,
+                  headers={"Authorization":"Bearer " + token, "Content-Type" : "application/json"},
+                  json = {
+                        "field": field,
+                        "fieldFilter": contains,
+                        "group": group,
+                        "metadata": metadata,
+                        "startTime": startTime,
+                        "endTime": endTime
+                  })
+    return values.json()
+
+class Dt4DSiteRepoDriver(SiteRepoDriver):
+
+    def _getSession(self):
+        authDriver = DT4DSiteAuthDriver()
+        authDriver.login()
+        return authDriver._session
+
+    def put(self, localRef: Path, siteRef: S3FileRef, jobContext: JobContext = None) -> S3FileRef:
+        # Book keeping for status emissions
+        iAmAJob = False
+        if (jobContext is None):
+            iAmAJob = True
+            jobContext = JobContext()
+        status = DT4DJobStatus(jobContext)
+        if (iAmAJob):
+            # emit the starting job status sequence
+            status.emit("PENDING")
+            status.emit("RUNNING")
+
+        # Emit our info status before hitting the API
+        status.setNativeInfo(JobStatus.makeRepoInfo(RepoOp.PUT, False, str(localRef), ""))
+        status.emit("MOVING")
+
+        repoPut(localRef, siteRef.getMetadata())
+
+        status.emit("MOVED")
+
+        if (iAmAJob):
+            # emit the successful job ending sequence
+            status.emit("FINISHED")
+            status.emit("COMPLETED")
+        MetaRepo.notate(S3FileRef)
+        return S3FileRef
+
+    def get(self, siteRef: S3FileRef, localRef: Path, jobContext: JobContext = None, fullPath = False) -> Path:
+        # Book keeping for status emissions
+        iAmAJob = False
+        if (jobContext is None):
+            iAmAJob = True
+            jobContext = JobContext()
+        status = DT4DJobStatus(jobContext)
+        if (iAmAJob):
+            # emit the starting job status sequence
+            status.emit("PENDING")
+            status.emit("RUNNING")
+
+        # Emit our info status before hitting the API
+        status.setNativeInfo(JobStatus.makeRepoInfo(RepoOp.PUT, False, "", str(localRef)))
+        status.emit("MOVING")
+
+        getFile = repoGet(siteRef.getId(), localRef, fullPath)
+
+        status.emit("MOVED")
+
+        if (iAmAJob):
+            # emit the successful job ending sequence
+            status.emit("FINISHED")
+            status.emit("COMPLETED")
+        #MetaRepo.Notate(S3FileRef)
+        return getFile
+
+    def find(self, siteRef: S3FileRef) -> [S3FileRef]:
+        sheets = None
+        if(siteRef.getId()):
+            sheets = repoFindById(siteRef.getId())
+        elif(siteRef.getMetadata()):   
+            sheets = repoFindByMetadata(siteRef.getMetadata())
+        remoteRefs = []
+        for sheet in sheets:
+            remoteRef = S3FileRef()
+            remoteRef.setId(sheet["id"])
+            if "resourceName" in sheet:
+                remoteRef.setName(sheet["resourceName"])
+            elif "fileName" in sheet:
+                remoteRef.setName(sheet["fileName"])
+            remoteRef.setTimestamp(sheet["timestamp"])
+            remoteRef.setSize(sheet["fileSizeBytes"])
+            remoteRef.setMetadata(sheet["metadata"])
+            remoteRefs.append(remoteRef)
+        return remoteRefs
+
+    def get_values(self, field, contains="", group="", metadata={}, startTime=None, endTime=None):
+        return repoGetValues(field, contains, group, metadata, startTime, endTime)
+
+#************************************************************************************************************************************
+
+#_repoDriver = LocalSiteRepoDriver()
+
+class DT4DSite(Site):
+    # There are no required args to instantiate a local site.
+    def __init__(self):
+        super(DT4DSite, self).__init__("dt4d", DT4DSiteAuthDriver(), DT4DSiteRunDriver(), Dt4DSiteRepoDriver(), None)
+
+
+
+#************************************************************************************************************************************
+
+
+# test
+if __name__ == '__main__':
+    logging.basicConfig()
+    logging.getLogger().setLevel(logging.DEBUG)
+
+    # define the DT4D site (which is known to model distinct "compute type" resources within it), and login
+#    site = Site("dt4d", DT4DSiteAuthDriver(), DT4DSiteRunDriver())
+#    site.getAuthDriver().login()
+
+    # define the job
+#    jdefn = JobDefn()
+#    jdefn.setName("HelloWorld")
+#    jdefn.setEntryPointPath([ "/Users/212578984/src/dt4d/py4dt4d", "py4dt4d-examples", "HelloWorld", "HelloWorld" ])
+
+    # run it local
+#    jdefn.setComputeType(LOCAL_COMPUTE_TYPE)
+#    status = site.getRunDriver().submitJob(jdefn)
+#    print("Local run status = " + str(status.getStatus()))
+
+    # run it remote on a named node type
+#    jdefn.setComputeType("Win-VDrive")
+#    status = site.getRunDriver().submitJob(jdefn)
+#    while (not status.isTerminal()):
+#        print("Remote run status = " + str(status.getStatus()) + " ...waiting another 15 seconds for job to finish")
+#        time.sleep(15)
+#        status = site.getRunDriver().getJobStatus(status.getNativeId())
+#    print("Remote run status = " + str(status.getStatus()))
+
+
+    site = DT4DSite()
+    site.getAuthDriver().login()
+    context = JobContext()
+    context.setId("ae19db11-d52f-4d2f-b298-2864bc7840b7")
+    context.setNativeId("ae19db11-d52f-4d2f-b298-2864bc7840b7")
+    status = site.getRunDriver().getJobStatus(context)
+    print("*** " + str(status))
+    print("Remote run status = " + str(status.getStatus()))
+
+
+# A Job Definition is the abstract representation of a job, the non-instantiated description.
+# The JobDefn will be passed to the Site's Run driver which will use the args to instantiate a job from the defn.
+# As time goes on, and the lwfm's refactoring of "sites" continues, additional arbitrary name=value pairs might get promoted
+# to be named explicitly at the class level.  Of note is "compute type" which is a mechanism to address jobs at specific computing
+# resources within the Site on which the job is run.  For example, an HPC site which has CPU and CPU+GPU nodes.
+
+from enum import Enum
+import logging
+
+from pathlib import Path
+
+from lwfm.base.LwfmBase import LwfmBase
+from lwfm.base.SiteFileRef import SiteFileRef
+
+
+class _JobDefnFields(Enum):
+    NAME               = "name"                        # for human convenience
+    COMPUTE_TYPE       = "computeType"                 # some sites define addressable compute resources within it
+    ENTRY_POINT        = "entryPoint"                  # defines the top-level "executable" command to pass to the site scheduler
+    JOB_ARGS           = "jobArgs"                     # arguments to the job - an array of string
+    REPO_OP            = "repoOp"                      # put, get
+    REPO_LOCAL_REF     = "repoLocalRef"                # local file reference
+    REPO_SITE_REF      = "repoSiteRef"                 # site file reference
+    # EXTRA_ARGS                                       # site schedulers vary widely - this dict permits arbitrary args
+
+
+class JobDefn(LwfmBase):
+    """
+    The static definition of a job, to be instantiated at runtime by the Site.Run subsystem.  The Job Defn is not presumed
+    to be portable - within will be baked arbitrary arguments, which might very well be Site-specific (e.g., parameters to a
+    specific Site HPC scheduler).
+
+    Attributes:
+
+    name - an optional name for human consumption
+
+    compute type - we can target the job at an optional compute type on the Site, a specific resource the Site provides;
+        the Site might have no such concept and present only one runtime option
+
+    entry point - a declaration of the command to run, from the perspective of the Site.  This can be anything from an actual
+        command string, or a complex serialized object - its entirely up to the Site how to specify and interpret the entry point -
+        again, the JobDefn is not presumed to be portable across Sites
+
+    job args - distinct from the entry point, the job might desire arbitrary arguments at runtime
+
+    """
+
+    def __init__(self):
+        super(JobDefn, self).__init__(None)
+
+    def setName(self, name: str) -> None:
+        LwfmBase._setArg(self, _JobDefnFields.NAME.value, name)
+
+    def getName(self) -> str:
+        return LwfmBase._getArg(self, _JobDefnFields.NAME.value)
+
+    def setComputeType(self, name: str) -> None:
+        LwfmBase._setArg(self, _JobDefnFields.COMPUTE_TYPE.value, name)
+
+    def getComputeType(self) -> str:
+        return LwfmBase._getArg(self, _JobDefnFields.COMPUTE_TYPE.value)
+
+    def setEntryPoint(self, entryPoint: str) -> None:
+        LwfmBase._setArg(self, _JobDefnFields.ENTRY_POINT.value, entryPoint)
+
+    def getEntryPoint(self) -> str:
+        return LwfmBase._getArg(self, _JobDefnFields.ENTRY_POINT.value)
+
+    def setJobArgs(self, args: [str]) -> None:
+        LwfmBase._setArg(self, _JobDefnFields.JOB_ARGS.value, args)
+
+    def getJobArgs(self) -> [str]:
+        return LwfmBase._getArg(self, _JobDefnFields.JOB_ARGS.value)
+
+
+#************************************************************************************************************************************
+
+class RepoOp(Enum):
+    PUT = "put"
+    GET = "get"
+
+
+class RepoJobDefn(JobDefn):
+    """
+    Moving data between Sites is expected to be common, and time consuming, and thus wanted to be performed asynchronously.
+    Thus wrapping a data movement as a job and setting a job event trigger to fire when the data move is complete would be common.
+    The RepoJobDefn as a subclass of JobDefn provides this convenience mechanism for wrapping a data move as an independent job.
+    """
+
+    def __init__(self):
+        super(RepoJobDefn, self).__init__()
+
+    def setRepoOp(self, repoOp: RepoOp) -> None:
+        LwfmBase._setArg(self, _JobDefnFields.REPO_OP.value, repoOp)
+
+    def getRepoOp(self) -> RepoOp:
+        return LwfmBase._getArg(self, _JobDefnFields.REPO_OP.value)
+
+    def setLocalRef(self, localRef: Path) -> None:
+        LwfmBase._setArg(self, _JobDefnFields.REPO_LOCAL_REF.value, str(localRef))
+
+    def getLocalRef(self) -> Path:
+        return Path(LwfmBase._getArg(self, _JobDefnFields.REPO_LOCAL_REF.value))
+
+    def setSiteRef(self, siteRef: SiteFileRef) -> None:
+        LwfmBase._setArg(self, _JobDefnFields.REPO_SITE_REF.value, siteRef)
+
+    def getSiteRef(self) -> SiteFileRef:
+        return LwfmBase._getArg(self, _JobDefnFields.REPO_SITE_REF.value)
+
+
+#************************************************************************************************************************************
+# test
+if __name__ == '__main__':
+    logging.basicConfig()
+    logging.getLogger().setLevel(logging.DEBUG)
+    jdefn = JobDefn()
+
+from enum import Enum
+
+from lwfm.base.LwfmBase import LwfmBase, _IdGenerator
+from lwfm.base.JobStatus import JobStatus, JobContext
+
+from abc import ABC, abstractmethod
+
+
+class _JobEventHandlerFields(Enum):
+    ID               = "id"                             # handler id
+    JOB_ID           = "jobId"
+    JOB_SITE_NAME    = "jobSiteName"
+    JOB_STATUS       = "jobStatus"
+    FIRE_DEFN        = "fireDefn"
+    TARGET_SITE_NAME = "targetSiteName"
+    TARGET_CONTEXT   = "targetContext"
+
+
+class JobEventHandler(LwfmBase):
+    """
+    Jobs emit status, incliuding informational status.  Some status events are terminal - "finished", "cancelled" - and some
+    are interim states.  Status strings in lwfm are normalized by the Site driver from the native Site status name set into the
+    lwfm canonical set.
+    We can set event handlers - on canonical status strings -
+        "when job <j1> running on Site <s1> reaches <state>, execute job <j2> on Site <s2>"
+    We can also set event handlers which fire after interrogating the body of the message.  The user must provide the implementation
+    of that filter.  An example use case - a Site emits an INFO status message when data is put using the Site.Repo interface, and
+    the body of the message includes the metadata used in the put.  If the metadata meets certain user-supplied filters, the
+    event handler fires.
+
+    This struct and potential derrived classes provide the means to describe the conditions under which a given job should fire
+    as a result of an upstream event or events, and when it fires, where and how.
+
+    Implementations of the Run.Registrar component provide a means to accept these JobEventHandler descriptors and monitor the
+    job status message traffic to determine when to fire them.
+
+
+    Some example event handler rules:
+        - job or set of jobs (to reach some state (or one or a set of states) completely or set in partial within some timeframe)
+        - fire once or fire many times, or fire when triggered until some TTL
+        - fire on a schedule
+        - fire when a job status header and/or body contains certain attributes / metadata
+
+    Attributes of the event handler:
+        - id: each is assigned a unique id
+        - site: filters to just status messages from named site or list of sites, may be omitted in which case all sites are considered
+        - rule function: takes a JobStatus and returns bool to indicate the rule is satisfied an the registered JobDefn should fire
+        - fire defn: the JobDefn to fire if the event handler rule is satisfied
+        - target site: the site on which the job defn will fire
+        - target context: the JobContext for digital threading to use when the job fires, if one is provided
+
+    To implement this functionality, the rule must be able to save state.  Registrar provides a means for the rule function
+    to post back tracking information.
+
+    """
+
+    def __init__(self,
+                 jobId: str, jobSiteName: str, jobStatus: str, fireDefn: str, targetSiteName: str,  targetContext: JobContext):
+        super(JobEventHandler, self).__init__(None)
+        self._setId(_IdGenerator.generateId())
+        LwfmBase._setArg(self, _JobEventHandlerFields.JOB_ID.value, jobId)
+        LwfmBase._setArg(self, _JobEventHandlerFields.JOB_SITE_NAME.value, jobSiteName)
+        LwfmBase._setArg(self, _JobEventHandlerFields.JOB_STATUS.value, jobStatus)
+        LwfmBase._setArg(self, _JobEventHandlerFields.FIRE_DEFN.value, fireDefn)
+        LwfmBase._setArg(self, _JobEventHandlerFields.TARGET_SITE_NAME.value, targetSiteName)
+        LwfmBase._setArg(self, _JobEventHandlerFields.TARGET_CONTEXT.value, targetContext)
+
+    def _setId(self, idValue: str) -> None:
+        LwfmBase._setArg(self, _JobEventHandlerFields.ID.value, idValue)
+
+    def getId(self) -> str:
+        return LwfmBase._getArg(self, _JobEventHandlerFields.ID.value)
+
+    def getJobSiteName(self) -> str:
+        return LwfmBase._getArg(self, _JobEventHandlerFields.JOB_SITE_NAME.value)
+
+    def getFireDefn(self) -> str:
+        return LwfmBase._getArg(self, _JobEventHandlerFields.FIRE_DEFN.value)
+
+    def getTargetSiteName(self) -> str:
+        return LwfmBase._getArg(self, _JobEventHandlerFields.TARGET_SITE_NAME.value)
+
+    def getTargetContext(self) -> str:
+        return LwfmBase._getArg(self, _JobEventHandlerFields.TARGET_CONTEXT.value)
+
+    def getHandlerId(self) -> str:
+        return self.getKey()
+
+    def getKey(self):
+        # We want to permit more than one event handler for the same job, but for now we'll limit it to one handler per
+        # canonical job status name.
+        return str("" + LwfmBase._getArg(self, _JobEventHandlerFields.JOB_ID.value) +
+                   "." +
+                   LwfmBase._getArg(self, _JobEventHandlerFields.JOB_STATUS.value))
+
+# Job Status: a record of a state of the job's execution.  The job may go through many states in its lifetime - on the actual
+# runtime Site the job status will be expressed in terms of their native status codes.  In lwfm, we desire canonical status
+# messages so job chaining is permitted.  Its the role of the Site's Run subsystem to produce these datagrams in their
+# canonical form, though we leave room to express the native info too.  There is no firm state transition / state machine for
+# job status - while "PENDING" means "submitted to run but not yet running", and "COMPLETE" means "job is done done stick a fork
+# in it", in truth the Site is free to emit whateever status code it desires at any moment.  Some status codes might be emitted
+# more than once (e.g. "INFO").  We provide a mechanism to track the job's parent-child relationships.
+
+
+from enum import Enum
+import logging
+from types import SimpleNamespace
+
+import os
+
+
+from datetime import datetime
+import pickle
+import json
+
+from lwfm.base.LwfmBase import LwfmBase, _IdGenerator
+from lwfm.base.JobDefn import RepoOp
+from lwfm.server.JobStatusSentinelClient import JobStatusSentinelClient
+
+
+class _JobStatusFields(Enum):
+    STATUS        = "status"                         # canonical status
+    NATIVE_STATUS = "nativeStatus"                   # the status code for the specific Run implementation
+    EMIT_TIME     = "emitTime"
+    RECEIVED_TIME = "receivedTime"
+    ID            = "id"                             # canonical job id
+    NATIVE_ID     = "nativeId"                       # Run implementation native job id
+    NAME          = "name"                           # optional human-readable job name
+    PARENT_JOB_ID = "parentJobId"                    # immediate predecessor of this job, if any - seminal job has no parent
+    ORIGIN_JOB_ID = "originJobId"                    # oldest ancestor - a seminal job is its own originator
+    SET_ID        = "setId"                          # optional id of a set if the job is part of a set
+    NATIVE_INFO   = "nativeInfo"                     # any additional info the native Run wants to put in the status message
+    SITE_NAME     = "siteName"                       # name of the Site which emitted the message
+    COMPUTE_TYPE  = "computeType"                    # a named resource on the Site, if any
+    GROUP         = "group"                          # a group id that the job belongs to, if any
+    USER          = "user"                         # a user id of the user that submitted the job, if any
+
+
+# The canonical set of status codes.  Run implementations will have their own sets, and they must provide a mapping into these.
+class JobStatusValues(Enum):
+    UNKNOWN   = "UNKNOWN"
+    PENDING   = "PENDING"
+    RUNNING   = "RUNNING"
+    INFO      = "INFO"
+    FINISHING = "FINISHING"
+    COMPLETE  = "COMPLETE"           # terminal state
+    FAILED    = "FAILED"             # terminal state
+    CANCELLED = "CANCELLED"          # terminal state
+
+    def isTerminal(self, stat):
+        try:
+            if (stat == self.COMPLETE) or (stat == self.FAILED) or (stat == self.CANCELLED):
+                return True
+            else:
+                return False
+        except:
+            logging.error("Exception thrown determining status value for stat=" + str(stat))
+            return False
+
+    def isTerminalSuccess(self, stat):
+        if (self.isTerminal(stat) and (stat == self.COMPLETE)):
+            return True
+        else:
+            return False
+
+    def isTerminalFailure(self, stat):
+        if (self.isTerminal(stat) and (stat == self.FAILED)):
+            return True
+        else:
+            return False
+
+    def isTerminalCancelled(self, stat):
+        if (self.isTerminal(stat) and (stat == self.CANCELLED)):
+            return True
+        else:
+            return False
+
+
+#************************************************************************************************************************************
+
+class JobContext(LwfmBase):
+    """
+    The runtime execution context of the job.  It contains the id of the job and references to its parent jobs, if any.
+    A Job Status can reference a Job Context, and then augument it with updated job status information.
+
+    Attributes:
+
+    id - the lwfm id of the executing job.  This is distinct from the "native job id" below, which is the id of the job on the
+        specific Site.  If the Site is "lwfm local", then one might expect that the id and the native id are the same, else one
+        should assume they are not.  lwfm ids are generated as uuids.  Sites can use whatever mechanism they prefer.
+
+    native id - the Site-generated job id
+
+    parent job id - a lwfm generated id, the immediate parent of this job, if any; a seminal job has no parent
+
+    origin job id - the elest parent in the job chain; a seminal job is its own originator
+
+    name - the job can have an optional name for human consumption, else the name is the lwfm job id
+
+    site name - the job is running (or has been submitted to the Site for queuing), therefore the Site name is known
+
+    compute type - if the Site distinguishes compute types, it can be noted here
+
+    """
+
+    def __init__(self, parentContext = None):
+        super(JobContext, self).__init__(None)
+        self.setId(_IdGenerator.generateId())
+        self.setNativeId(self.getId())
+        if (parentContext is not None):
+            self.setParentJobId(parentContext.getParentJobId())
+            self.setOriginJobId(parentContext.getOriginJobId())
+        else:
+            self.setParentJobId("")                     # a seminal job has no parent
+            self.setOriginJobId(self.getId())           # a seminal job is its own originator
+        self.setName(self.getId())
+        self.setComputeType("")
+        self.setSiteName("")
+
+    def setId(self, idValue: str) -> None:
+        LwfmBase._setArg(self, _JobStatusFields.ID.value, idValue)
+
+    def getId(self) -> str:
+        return LwfmBase._getArg(self, _JobStatusFields.ID.value)
+
+    def setNativeId(self, idValue: str) -> None:
+            LwfmBase._setArg(self, _JobStatusFields.NATIVE_ID.value, idValue)
+
+    def getNativeId(self) -> str:
+        return LwfmBase._getArg(self, _JobStatusFields.NATIVE_ID.value)
+
+    def setParentJobId(self, idValue: str) -> None:
+        LwfmBase._setArg(self, _JobStatusFields.PARENT_JOB_ID.value, idValue)
+
+    def getParentJobId(self) -> str:
+        return LwfmBase._getArg(self, _JobStatusFields.PARENT_JOB_ID.value)
+
+    def setOriginJobId(self, idValue: str) -> None:
+        LwfmBase._setArg(self, _JobStatusFields.ORIGIN_JOB_ID.value, idValue)
+
+    def getOriginJobId(self) -> str:
+        return LwfmBase._getArg(self, _JobStatusFields.ORIGIN_JOB_ID.value)
+
+    def setJobSetId(self, idValue: str) -> None:
+        LwfmBase._setArg(self, _JobStatusFields.SET_ID.value, idValue)
+
+    def getJobSetId(self) -> str:
+        return LwfmBase._getArg(self, _JobStatusFields.SET_ID.value)    
+
+    # job name
+    def setName(self, name: str) -> None:
+        LwfmBase._setArg(self, _JobStatusFields.NAME.value, name)
+
+    # job name
+    def getName(self) -> str:
+        return LwfmBase._getArg(self, _JobStatusFields.NAME.value)
+
+    def setSiteName(self, name: str) -> None:
+        LwfmBase._setArg(self, _JobStatusFields.SITE_NAME.value, name)
+
+    def getSiteName(self) -> str:
+        return LwfmBase._getArg(self, _JobStatusFields.SITE_NAME.value)
+
+    def setComputeType(self, name: str) -> None:
+        LwfmBase._setArg(self, _JobStatusFields.COMPUTE_TYPE.value, name)
+
+    def getComputeType(self) -> str:
+        return LwfmBase._getArg(self, _JobStatusFields.COMPUTE_TYPE.value)
+
+    def setGroup(self, name: str) -> None:
+        LwfmBase._setArg(self, _JobStatusFields.GROUP.value, name)
+
+    def getGroup(self) -> str:
+        return LwfmBase._getArg(self, _JobStatusFields.GROUP.value)
+
+    def setUser(self, name: str) -> None:
+        LwfmBase._setArg(self, _JobStatusFields.USER.value, name)
+
+    def getUser(self) -> str:
+        return LwfmBase._getArg(self, _JobStatusFields.USER.value)
+
+    def toJSON(self):
+        return self.serialize()
+
+    def serialize(self):
+        out_bytes = pickle.dumps(self, 0)
+        out_str = out_bytes.decode(encoding='ascii')
+        return out_str
+
+    @staticmethod
+    def deserialize(s: str):
+        in_json = json.dumps(s)
+        in_obj = pickle.loads(json.loads(in_json).encode(encoding='ascii'))
+        return in_obj
+
+
+#************************************************************************************************************************************
+
+
+class JobStatus(LwfmBase):
+    """
+    Over the lifetime of the running job, it may emit many status messages.  (Or, more specifically, lwfm might poll the remote
+    Site for an updated status of a job it is tracking.)
+
+    The Job Status references the Job Context of the running job, which contains the id of the job and other originating information.
+
+    The Job Status is then augmented with the updated status info.  Like job ids, which come in canonical lwfm and Site-specific
+    forms (and we track both), so do job status strings - there's the native job status, and the mapped canonical status.
+
+    Attributes:
+
+    job context - the Job Context for the job, which includes the job id
+
+    status - the current canonical status string
+
+    native status - the current native status string
+
+    emit time - the timestamp when the Site emitted the status - the Site driver will need to populate this value
+
+    received time - the timestamp when lwfm received the Job Status from the Site; this can be used to study latency in
+        status receipt (which is by polling)
+
+    native info - the Site may inject Site-specific status information into the Job Status message
+
+    status map - a constant, the mapping of Site-native status strings to canonical status strings; native lwfm local jobs will use
+        the literal mapping, and Site drivers will implement Job Status subclasses which provide their own Site-to-canonical
+        mapping.
+
+    """
+
+    statusMap:          dict = None                             # maps native status to canonical status
+    #statusHistory:      dict = None                             # history of status messages, not copied by copy constructor
+    jobContext:         JobContext = None                       # job id tracking info
+
+    def __init__(self, jobContext: JobContext):
+        super(JobStatus, self).__init__(None)
+        if (jobContext is None):
+            self.jobContext = JobContext()
+        else:
+            self.jobContext = jobContext
+        # default map
+        self.setStatusMap( {
+            "UNKNOWN"   : JobStatusValues.UNKNOWN,
+            "PENDING"   : JobStatusValues.PENDING,
+            "RUNNING"   : JobStatusValues.RUNNING,
+            "INFO"      : JobStatusValues.INFO,
+            "FINISHING" : JobStatusValues.FINISHING,
+            "COMPLETE"  : JobStatusValues.COMPLETE,
+            "FAILED"    : JobStatusValues.FAILED,
+            "CANCELLED" : JobStatusValues.CANCELLED
+        })
+        self.setReceivedTime(datetime.utcnow())
+        self.setStatus(JobStatusValues.UNKNOWN)
+
+
+    def getJobContext(self) -> JobContext:
+        return self.jobContext
+
+    def setJobContext(self, jobContext: JobContext) -> None:
+        self.jobContext = jobContext
+
+    def setStatus(self, status: JobStatusValues) -> None:
+        LwfmBase._setArg(self, _JobStatusFields.STATUS.value, status)
+
+    def getStatus(self) -> JobStatusValues:
+        return LwfmBase._getArg(self, _JobStatusFields.STATUS.value)
+
+    def isTerminal(self) -> bool:
+        return ( (self.getStatus() == JobStatusValues.COMPLETE) or
+                 (self.getStatus() == JobStatusValues.FAILED)   or
+                 (self.getStatus() == JobStatusValues.CANCELLED) )
+
+    def getStatusValue(self) -> str:
+        return LwfmBase._getArg(self, _JobStatusFields.STATUS.value).value
+
+    def setNativeStatusStr(self, status: str) -> None:
+        LwfmBase._setArg(self, _JobStatusFields.NATIVE_STATUS.value, status)
+        self.mapNativeStatus()
+
+    def getNativeStatusStr(self) -> str:
+        return LwfmBase._getArg(self, _JobStatusFields.NATIVE_STATUS.value)
+
+    def mapNativeStatus(self) -> None:
+        try:
+            self.setStatus(self.statusMap[self.getNativeStatusStr()])
+        except Exception as ex:
+            logging.error("Unable to map the native status to canonical: {}".format(ex))
+            self.setStatus(JobStatusValues.UNKNOWN)
+
+    def getStatusMap(self) -> dict:
+        return self.statusMap
+
+    def setStatusMap(self, statusMap: dict) -> None:
+        self.statusMap = statusMap
+
+    def setEmitTime(self, emitTime: datetime) -> None:
+        LwfmBase._setArg(self, _JobStatusFields.EMIT_TIME.value, emitTime.timestamp() * 1000)
+
+    def getEmitTime(self) -> datetime:
+        try:
+            ms = int(LwfmBase._getArg(self, _JobStatusFields.EMIT_TIME.value))
+            return datetime.utcfromtimestamp(ms//1000).replace(microsecond=ms%1000*1000)
+        except:
+            # TODO
+            return datetime.now()
+
+    def setReceivedTime(self, receivedTime: datetime) -> None:
+        LwfmBase._setArg(self, _JobStatusFields.RECEIVED_TIME.value, receivedTime.timestamp() * 1000)
+
+    def getReceivedTime(self) -> datetime:
+        ms = int(LwfmBase._getArg(self, _JobStatusFields.RECEIVED_TIME.value))
+        return datetime.utcfromtimestamp(ms//1000).replace(microsecond=ms%1000*1000)
+
+    def setNativeInfo(self, info: str) -> None:
+        LwfmBase._setArg(self, _JobStatusFields.NATIVE_INFO.value, info)
+
+    def getNativeInfo(self) -> str:
+        return LwfmBase._getArg(self, _JobStatusFields.NATIVE_INFO.value)
+
+#    def setStatusHistory(self, history: dict) -> None:
+#        self._statusHistory = history
+#
+#    def getStatusHistory(self) -> dict:
+#        return self._statusHistory
+
+    def serialize(self):
+        return pickle.dumps(self, 0)
+
+
+    # zero out state-sensative fields
+    def clear(self):
+        zeroTime = 0 if os.name != 'nt' else 24*60*60 # Windows requires an extra day or we get an OS error
+        self.setReceivedTime(datetime.fromtimestamp(zeroTime))
+        self.setEmitTime(datetime.fromtimestamp(zeroTime))
+        self.setNativeInfo("")
+
+
+    # Send the status message to the lwfm service.
+    def emit(self, status: str = None) -> bool:
+        if status:
+            self.setNativeStatusStr(status)
+        self.setEmitTime(datetime.utcnow())
+        try:
+            jssc = JobStatusSentinelClient()
+            jssc.emitStatus(self.getJobContext().getId(), self.getStatus().value, self.serialize())
+            self.clear()
+            return True
+        except Exception as ex:
+            logging.error(str(ex))
+            return False
+
+    def isTerminal(self) -> bool:
+        return self.getStatus().isTerminal(self.getStatus())
+
+    def isTerminalSuccess(self) -> bool:
+        return self.getStatus().isTerminalSuccess(self.getStatus())
+
+    def isTerminalFailure(self) -> bool:
+        return self.getStatus().isTerminalFailure(self.getStatus())
+
+    def isTerminalCancelled(self) -> bool:
+        return self.getStatus().isTerminalCancelled(self.getStatus())
+
+
+    def toJSON(self):
+        return self.serialize()
+
+    def serialize(self):
+        out_bytes = pickle.dumps(self, 0)
+        out_str = out_bytes.decode(encoding='ascii')
+        return out_str
+
+    @staticmethod
+    def deserialize(s: str):
+        in_json = json.dumps(s)
+        in_obj = pickle.loads(json.loads(in_json).encode(encoding='ascii'))
+        return in_obj
+
+
+    @staticmethod
+    def makeRepoInfo(verb: RepoOp, success: bool, fromPath: str, toPath: str) -> str:
+        return ("[" + verb.value + "," + str(success) + "," + fromPath + "," + toPath + "]")
+
+    def toString(self) -> str:
+        s = ("" + str(self.getJobContext().getId()) + "," + str(self.getJobContext().getParentJobId()) + "," +
+             str(self.getJobContext().getOriginJobId()) + "," +
+             str(self.getJobContext().getNativeId()) + "," +
+             str(self.getEmitTime()) + "," + str(self.getStatusValue()) + "," + str(self.getJobContext().getSiteName()))
+        if (self.getStatus() == JobStatusValues.INFO):
+            s += "," + str(self.getNativeInfo())
+        return s
+
+
+#************************************************************************************************************************************
+
+
+# test
+if __name__ == '__main__':
+    logging.basicConfig()
+    logging.getLogger().setLevel(logging.DEBUG)
+    status = JobStatus()
+    statusMap = {
+        "NODE_FAIL" : JobStatusValues.FAILED
+        }
+    status.setStatusMap(statusMap)
+    status.setNativeStatusStr("NODE_FAIL")
+    status.setEmitTime(datetime.utcnow())
+
+    logging.info(status.serialize())
+
+# The Job Status Sentinel watches for Job Status events and fires a JobDefn to a Site when an event of interest occurs.
+# The service exposes a way to set/unset event handlers, list jobs currently being watched.
+# The service must have some persistence to allow for very long running jobs.
+#
+# We'll implement simple event handling for now, but one could envision handlers on sets of jobs, fuzzy satisfaction, timeouts,
+# recurring event handlers, scheduled jobs, etc.
+#
+
+from enum import Enum
+import logging
+import threading
+
+from lwfm.base.JobDefn import JobDefn
+from lwfm.base.JobStatus import JobStatus, JobStatusValues, JobContext
+from lwfm.base.Site import Site
+from lwfm.base.LwfmBase import LwfmBase, _IdGenerator
+from lwfm.base.JobEventHandler import JobEventHandler, _JobEventHandlerFields
+
+
+#************************************************************************************************************************************
+
+class JobStatusSentinel:
+
+    _timer = None
+    _eventHandlerMap = dict()
+    # We can make this adaptive later on, for now let's just wait five minutes between cycling through the list
+    STATUS_CHECK_INTERVAL_SECONDS = 15 # 300
+
+    def __init__(self):
+        self._timer = threading.Timer(self.STATUS_CHECK_INTERVAL_SECONDS, JobStatusSentinel.checkEvents, (self,))
+        self._timer.start()
+
+    def checkEvents(self):
+        print("*** waking up to check events num waiting handlers = " + str(len(self._eventHandlerMap)))
+        # Run through each event, checking the status
+        for key in list(self._eventHandlerMap):
+            handler = self._eventHandlerMap[key]
+            site = handler._getArg( _JobEventHandlerFields.JOB_SITE_NAME.value)
+            # Local jobs can instantly emit their own statuses, on demand
+            if site != "local":
+                # Get the job's status
+                jobId = handler._getArg( _JobEventHandlerFields.JOB_ID.value)
+                runDriver = Site.getSiteInstanceFactory(site).getRunDriver()
+                context = JobContext()
+                context.setId(jobId)
+                context.setNativeId(jobId)
+                jobStatus = runDriver.getJobStatus(context)
+                if ((handler._getArg( _EventHandlerFields.FIRE_DEFN.value) == "") or
+                    (handler._getArg( _EventHandlerFields.FIRE_DEFN.value) is None)):
+                    # if we are in a terminal state, "run the handler" which means "evict" the job from checking
+                    # in the future - we have seen its terminal state
+                    # we do have a target context, which gives us the parent and origin job ids
+                    context = (handler._getArg( _JobEventHandlerFields.TARGET_CONTEXT.value))
+                    jobStatus.setParentJobId(context.getParentJobId())
+                    jobStatus.setOriginJobId(context.getOriginJobId())
+                    jobStatus.setNativeId(context.getNativeId())
+                    jobStatus.getJobContext().setId(context.getId())
+                    jobStatus.emit()
+                    if (jobStatus.isTerminal()):
+                        # evict
+                        key = JobEventHandler(jobId, None, "<<TERMINAL>>", None, None, None).getKey()
+                        self.unsetEventHandler(key)
+                else:
+                    key = JobEventHandler(jobId, None, jobStatus, None, None, None).getKey()
+                    self.runHandler(key, jobStatus)
+
+        # Timers only run once, so retrigger it
+        self._timer = threading.Timer(self.STATUS_CHECK_INTERVAL_SECONDS, JobStatusSentinel.checkEvents, (self,))
+        self._timer.start()
+
+
+    # Regsiter an event handler with the sentinel.  When a jobId running on a job Site emits a particular Job Status, fire
+    # the given JobDefn (serialized) at the target Site.  Return the handler id.
+    def setEventHandler(self, jobId: str, jobSiteName: str, jobStatus: str,
+                        fireDefn: str, targetSiteName: str, targetContext: JobContext) -> str:
+        eventHandler = JobEventHandler(jobId, jobSiteName, jobStatus, fireDefn, targetSiteName, targetContext)
+        self._eventHandlerMap[eventHandler.getKey()] = eventHandler
+        return eventHandler.getKey()
+
+    def unsetEventHandler(self, handlerId: str) -> bool:
+        try:
+            self._eventHandlerMap.pop(handlerId)
+            return True
+        except:
+            return False
+
+    def unsetAllEventHandlers(self) -> None:
+        self._eventHandlerMap = dict()
+
+    def hasHandler(self, handlerId):
+        return handlerId in self._eventHandlerMap
+
+    def listActiveHandlers(self) -> [str]:
+        handlers = []
+        for key in self._eventHandlerMap:
+            handlers.append(key)
+        return handlers
+
+    def runHandler(self, handlerId, jobStatus):
+        # unset the event handler ASAP to help prevent race conditions
+        if handlerId not in self._eventHandlerMap:
+            return False
+        handler = self._eventHandlerMap[handlerId]
+        self.unsetEventHandler(handlerId)
+
+        if (handler._getArg( _JobEventHandlerFields.FIRE_DEFN.value) == ""):
+            # we have no defn to fire - we've just been tracking status
+            return True
+
+        # Run in a thread instead of a subprocess so we don't have to make assumptions about the environment
+        site = Site.getSiteInstanceFactory(handler._getArg( _JobEventHandlerFields.TARGET_SITE_NAME.value))
+        runDriver = site.getRunDriver().__class__
+        jobContext = handler._getArg(_JobEventHandlerFields.TARGET_CONTEXT.value)
+        jobContext.setOriginJobId(jobStatus.getJobContext().getOriginJobId())
+        # Note: Comma is needed after FIRE_DEFN to make this a tuple. DO NOT REMOVE
+        thread = threading.Thread(target = runDriver._submitJob,
+                                  args = (handler._getArg( _JobEventHandlerFields.FIRE_DEFN.value),jobContext,) )
+        try:
+            thread.start()
+        except Exception as ex:
+            logging.error("Could not run job: " + ex)
+            return False
+        return True
+
+    def exit(self):
+        self._timer.cancel()
+
+
+#************************************************************************************************************************************
+
+# test
+if __name__ == '__main__':
+
+    # basic server list handling
+    logging.basicConfig()
+    logging.getLogger().setLevel(logging.INFO)
+    jss = JobStatusSentinel()
+    handlerId = jss.setEventHandler("123", None, JobStatusValues.INFO.value, None, None)
+    logging.info(str(jss.listActiveHandlers()))
+    jss.unsetEventHandler(handlerId)
+    logging.info(str(jss.listActiveHandlers()))
+    jss.exit()
+import pickle
+import requests
+import logging
+import json
+
+from lwfm.base.JobDefn import JobDefn
+
+class JobStatusSentinelClient:
+    _JSS_URL = "http://127.0.0.1:3000"
+
+    def getUrl(self):
+        return self._JSS_URL
+
+
+    def setTerminalSentinel(self, jobId: str, parentId: str, originId: str, nativeId: str, siteName: str) -> str:
+        payload = {}
+        payload["jobId"] = jobId
+        if (parentId is not None):
+            payload["parentId"] = parentId
+        else:
+            payload["parentId"] = ""
+        payload["originId"] = originId
+        payload["nativeId"] = nativeId
+        payload["siteName"] = siteName
+        response = requests.post(f'{self.getUrl()}/setTerminal', payload)
+        if response.ok:
+            return response.text
+        else:
+            logging.error(response.text)
+            return response.text
+
+
+    # returns the "key" for the trigger, a compound of the job id, status, etc.
+    def setEventHandler(self, jobId: str, jobSiteName: str, jobStatus: str,
+                        fireDefn: JobDefn, targetSiteName: str, targetContext = None) -> str:
+        payload = {}
+        payload["jobId"] = jobId
+        payload["jobSiteName"] = jobSiteName
+        payload["jobStatus"] = jobStatus
+        if (fireDefn is not None) and (targetSiteName is not None):
+            payload["fireDefn"] = pickle.dumps(fireDefn, 0).decode() # Use protocol 0 so we can easily convert to an ASCII string
+            payload["targetSiteName"] = targetSiteName
+            if (targetContext is not None):
+                try:
+                    payload["targetContext"] = targetContext.serialize()
+                except Exception as ex:
+                    logging.error(ex)
+                    return None
+            else:
+                payload["targetContext"] = ""
+        else:
+            payload["fireDefn"] = ""
+            payload["targetSiteName"] = ""
+            payload["targetContext"] = ""
+        response = requests.post(f'{self.getUrl()}/set', payload)
+        if response.ok:
+            return response.text
+        else:
+            logging.error(response.text)
+            return None
+
+    def unsetEventHandler(self, handlerId: str) -> bool:
+        response = requests.get(f'{self.getUrl()}/unset/{handlerId}')
+        if response.ok:
+            return True
+        else:
+            return False
+
+    def unsetAllEventHandlers(self) -> bool:
+        response = requests.get(f'{self.getUrl()}/unsetAll')
+        if response.ok:
+            return True
+        else:
+            return False
+
+    def listActiveHandlers(self) -> [str]:
+        response = requests.get(f'{self.getUrl()}/list')
+        if response.ok:
+            return eval(response.text)
+        else:
+            logging.error(response)
+            return None
+
+    def emitStatus(self, jobId, jobStatus, statusBlob):
+        data = {'jobId' : jobId,
+                'jobStatus': jobStatus,
+                'statusBlob': statusBlob}
+        response = requests.post(f'{self.getUrl()}/emit', data=data)
+        if response.ok:
+            return None
+        else:
+            logging.error(response)
+            return None
+
+    def getStatusBlob(self, jobId) -> str:
+        response = requests.get(f'{self.getUrl()}/status/{jobId}')
+        try:
+            if response.ok:
+                if (response.text == ""):
+                    return None
+                else:
+                    return response.text
+            else:
+                return None
+        except:
+            return None
+
+    def getStatuses(self):
+        response = requests.get(f'{self.getUrl()}/all/statuses')
+        if response.ok:
+            if (response.text == ""):
+                return None
+            else:
+                statuses =  json.loads(str(response.text))
+                return statuses
+        else:
+            return None
+
+    def getWorkflowUrl(self, jobContext) -> str:
+        return "" + self.getUrl() + "/wfthread/" + jobContext.getId()
+
+
+#************************************************************************************************************************************
+
+# test
+if __name__ == '__main__':
+
+    # basic client test - assumes the JSS Svc is running and exposing an HTTP API
+    jssClient = JobStatusSentinelClient()
+    logging.info("*** " + str(jssClient.listActiveHandlers()))
+    logging.info("*** " + str(jssClient.unsetAllEventHandlers()))
+    handlerId = jssClient.setEventHandler("123", "nersc", "INFO", "{jobDefn}", "nersc")
+    logging.info("*** " + handlerId)
+    logging.info("*** " + str(jssClient.listActiveHandlers()))
+    logging.info("*** " + str(jssClient.unsetEventHandler(handlerId)))
+
+#************************************************************************************************************************************
+# Flask app
+
+from flask import Flask, request, jsonify
+import pickle
+from lwfm.server.JobStatusSentinel import JobStatusSentinel
+from lwfm.base.JobEventHandler import JobEventHandler
+from lwfm.base.JobStatus import JobStatus, JobContext
+from lwfm.store.RunStore import RunJobStatusStore
+import logging
+
+app = Flask(__name__)
+jss = JobStatusSentinel()
+
+# most recent status
+_jobStatusCache = {}
+
+# history - to be replaced with a real DB TODO
+_jobStatusHistory = []
+
+@app.route('/')
+def index():
+  return str(True)
+
+@app.route('/emit', methods=['POST'])
+def emitStatus():
+    jobId = request.form['jobId']
+    jobStatus = request.form['jobStatus']
+    statusBlob = request.form['statusBlob']
+    statusObj = JobStatus.deserialize(statusBlob)
+    # persist it for posterity
+    RunJobStatusStore().write(statusObj)
+    # store it locally for convenience
+    _jobStatusCache[jobId] = statusObj
+    _jobStatusHistory.append(statusObj)
+    key = JobEventHandler(jobId, None, jobStatus, None, None, None).getKey()
+    jss.runHandler(key, statusObj) # This will check to see if the handler is in the JSS store, and run if so
+    return '', 200
+
+@app.route('/status/<jobId>')
+def getStatus(jobId : str):
+    try:
+        stat = _jobStatusCache[jobId]
+        try:
+            return stat.serialize()
+        except ex as Exception:
+            print("*** exception from stat.serialize() " + str(ex))
+            return ""
+    except:
+        return ""
+
+@app.route('/all/statuses')
+def getAllStatuses():
+    print("Starting get statuses")
+    try:
+        statuses = []
+        for jobId in _jobStatusCache:
+            try:
+                status = _jobStatusCache[jobId]
+                statuses.append(status.toJSON())
+            except ex as Exception:
+                print("*** exception from stat.serialize() " + str(ex))
+                return ""
+    except Exception as e:
+        print("exception: " + str(e))
+        return ""
+    return jsonify(statuses)
+
+@app.route('/set', methods = ['POST'])
+def setHandler():
+    jobId = request.form['jobId']
+    jobSiteName = request.form['jobSiteName']
+    jobStatus = request.form['jobStatus']
+    try:
+        fireDefn = pickle.loads(request.form['fireDefn'].encode())
+    except:
+        fireDefn = ""
+    targetSiteName = request.form['targetSiteName']
+    targetContextStr = request.form['targetContext']
+    if (targetContextStr == ""):
+        targetContext = JobContext()
+    else:
+        targetContext = JobContext.deserialize(targetContextStr)
+    targetContext.setParentJobId(jobId)
+    # set the origin
+    handlerId = jss.setEventHandler(jobId, jobSiteName, jobStatus, fireDefn, targetSiteName, targetContext)
+    return handlerId
+
+
+@app.route('/setTerminal', methods = ['POST'])
+def setTerminal():
+    try:
+      jobId = request.form['jobId']
+      parentId = request.form['parentId']
+      originId = request.form['originId']
+      nativeId = request.form['nativeId']
+      siteName = request.form['siteName']
+      targetContext = JobContext()
+    except ex as Exception:
+      print(str(ex))
+    targetContext.setId(jobId)
+    targetContext.setParentJobId(parentId)
+    targetContext.setOriginJobId(originId)
+    targetContext.setNativeId(nativeId)
+    jss.setEventHandler(nativeId, siteName, "<<TERMINAL>>", "", "", targetContext)
+    return ""
+
+
+# unset a given handler
+@app.route('/unset/<handlerId>')
+def unsetHandler(handlerId : str):
+    return str(jss.unsetEventHandler(handlerId))
+
+# unset all handers
+@app.route('/unsetAll')
+def unsetAllHandlers():
+    jss.unsetAllEventHandlers()
+    return str(True)
+
+# list the ids of all active handers
+@app.route('/list')
+def listHandlers():
+    return str(jss.listActiveHandlers())
+
+def _getStatusHistory(jobId: str) -> []:
+    results = []
+    for record in _jobStatusHistory:
+        if (record.getJobContext().getId() == jobId):
+            results.append(record)
+    return results
+
+
+def _buildThreadJson(jobId: str) -> str:
+    # get the status history for the seminal job
+    data = {}
+    statusList = _getStatusHistory(jobId)
+    data[jobId] = statusList
+    # find all jobs which list this job as the parent
+    children = _getChildren(jobId)
+    for child in children:
+        statusList = _getStatusHistory(child.getJobContext().getId())
+        data[child.getJobContext().getId()] = statusList
+        # does this child have children?
+        subkids = _getChildren(child.getJobContext().getId())
+
+
+
+
+def _buildWFThread(jobId: str) -> str:
+    status = getStatus(jobId)
+    # does the job have a parent?
+    if (status.getOriginJobId() != status.getJobContext().getId()):
+        # this job is not seminal - go up the tree
+        threadJson = _buildThreadJson(status.getOriginJobId())
+    else:
+        threadJson = _buildThreadJson(status.getJobContext().getId())
+    return threadJson
+
+# get the digital thread for a given workflow - returns a JSON blob
+@app.route('/wfthread/<jobId>')
+def getWFThread(jobId: str):
+  thread = _buildWFThread(jobId)
+  return thread
+
+# LocalSiteDriver: an implementation of Site and its constituent Auth, Run, Repo interfaces for a local to the user runtime
+# environment.  Unsecure, as this is local and we assume the user is themselves already.
+
+import logging
+
+import os
+import shutil
+import multiprocessing
+import time
+import pickle
+import json
+import math
+from typing import Callable
+
+from datetime import datetime
+from dateutil.relativedelta import relativedelta
+from pathlib import Path
+
+from lwfm.base.Site import Site, SiteAuthDriver, SiteRunDriver, SiteRepoDriver
+from lwfm.base.SiteFileRef import SiteFileRef, FSFileRef
+from lwfm.base.JobDefn import JobDefn, RepoJobDefn, RepoOp
+from lwfm.base.JobStatus import JobStatus, JobStatusValues, JobContext
+from lwfm.base.JobEventHandler import JobEventHandler
+from lwfm.base.MetaRepo import MetaRepo
+from lwfm.server.JobStatusSentinelClient import JobStatusSentinelClient
+
+
+#************************************************************************************************************************************
+
+SITE_NAME = "local"
+
+#************************************************************************************************************************************
+
+class LocalJobStatus(JobStatus):
+    def __init__(self, jcontext: JobContext = None):
+        super(LocalJobStatus, self).__init__(jcontext)
+        # use default canonical status map
+        self.getJobContext().setSiteName(SITE_NAME)
+
+    def toJSON(self):
+        return self.serialize()
+
+    def serialize(self):
+        out_bytes = pickle.dumps(self, 0)
+        out_str = out_bytes.decode(encoding='ascii')
+        return out_str
+
+    @staticmethod
+    def deserialize(s: str):
+        in_json = json.dumps(s)
+        in_obj = pickle.loads(json.loads(in_json).encode(encoding='ascii'))
+        return in_obj
+
+
+
+
+#************************************************************************************************************************************
+
+class LocalSiteAuthDriver(SiteAuthDriver):
+    # Because this is running locally, we don't need any authentication
+    def login(self, force: bool=False) -> bool:
+        return True
+
+    def isAuthCurrent(self) -> bool:
+        return True
+
+
+#***********************************************************************************************************************************
+
+
+class LocalSiteRunDriver(SiteRunDriver):
+
+    _pendingJobs = {}
+
+    def _runJob(self, jdefn, jobStatus):
+        # Putting the job in a new thread means we can easily run it asynchronously while still emitting statuses before and after
+        #Emit RUNNING status
+        jobStatus.emit(JobStatusValues.RUNNING.value)
+        try:
+            # This is synchronous, so we wait here until the subprocess is over. Check=True raises an exception on non-zero returns
+            if (isinstance(jdefn, RepoJobDefn)):
+                # run the repo job
+                if (jdefn.getRepoOp() == RepoOp.PUT):
+                    _repoDriver.put(jdefn.getLocalRef(), jdefn.getSiteRef(), jobStatus.getJobContext())
+                elif (jdefn.getRepo() == RepoOp.GET):
+                    _repoDriver.get(jdefn.getSiteRef(), jdefn.getLocalRef(), jobStatus.getJobContext())
+                else:
+                    logging.error("Unknown repo operation")
+            else:
+                # run a command line job
+                cmd = jdefn.getEntryPoint()
+                if (jdefn.getJobArgs() is not None):
+                    for arg in jdefn.getJobArgs():
+                        cmd += " " + arg
+                os.system(cmd)
+            #Emit success statuses
+            jobStatus.emit(JobStatusValues.FINISHING.value)
+            jobStatus.emit(JobStatusValues.COMPLETE.value)
+        except Exception as ex:
+            logging.error("ERROR: Job failed %s" % (ex))
+            #Emit FAILED status
+            jobStatus.emit(JobStatusValues.FAILED.value)
+
+    def submitJob(self, jdefn: JobDefn, parentContext: JobContext = None) -> JobStatus:
+        if (parentContext is None):
+            parentContext = JobContext()
+        # In local jobs, we spawn the job in a new child process
+        jstatus = LocalJobStatus(parentContext)
+
+        # Let the sentinel know the job is ready
+        jstatus.emit(JobStatusValues.PENDING.value)
+
+        # Run the job in a new thread so we can wrap it in a bit more code
+        thread = multiprocessing.Process(target=self._runJob, args=[jdefn, jstatus])
+        thread.start()
+        self._pendingJobs[jstatus.getJobContext().getId()] = thread
+
+        return jstatus
+
+    def getJobStatus(self, jobContext: JobContext) -> JobStatus:
+        blob = JobStatusSentinelClient().getStatusBlob(jobContext.getId())
+        if (blob is None):
+            status = LocalJobStatus(jobContext)
+        else:
+            status = JobStatus.deserialize(blob)
+        return status
+
+    def cancelJob(self, jobContext: JobContext) -> bool:
+        # Find the locally running thread and kill it
+        try:
+            thread = self._pendingJobs[jobContext.getId()]
+            if (thread is None):
+                return False
+            logging.info("LocalSiteDriver.cancelJob(): calling terminate on job " + jobContext.getId())
+            thread.terminate()
+            jstatus = LocalJobStatus(jobContext)
+            jstatus.emit(JobStatusValues.CANCELLED.value)
+            self._pendingJobs[jobContext.getId()] = None
+            return True
+        except Exception as ex:
+            logging.error("ERROR: Could not cancel job %d: %s" % (jobContext.getId(), ex))
+            return False
+
+
+    def listComputeTypes(self) -> [str]:
+        return ["local"]
+
+
+    def setEventHandler(self, jobContext: JobContext, jobStatus: JobStatusValues, statusFilter: Callable,
+                        newJobDefn: JobDefn, newJobContext: JobContext, newSiteName: str) -> JobEventHandler:
+        if (newSiteName is None):
+            newSiteName = "local"
+        JobStatusSentinelClient().setEventHandler(jobContext.getId(), jobContext.getSiteName(), jobStatus.value,
+                                                  newJobDefn, newSiteName, newJobContext)
+
+
+    def unsetEventHandler(self, jeh: JobEventHandler) -> bool:
+        raise NotImplementedError()
+
+
+    def listEventHandlers(self) -> [JobEventHandler]:
+        raise NotImplementedError()
+
+    def getJobList(self, startTime: int, endTime: int) -> [JobStatus]:
+        statuses = []
+        serializedStatuses = JobStatusSentinelClient().getStatuses()
+        if serializedStatuses is None:
+            serializedStatuses = []
+        for serializedStatus in serializedStatuses:
+            status = LocalJobStatus.deserialize(serializedStatus)
+            startDate = datetime.fromtimestamp(math.ceil(startTime / 1000))
+            endDate = datetime.fromtimestamp(math.ceil(endTime / 1000))
+            statusDate = status.getEmitTime() - relativedelta(hours=8)
+            print("The start date of the range: {}".format(startDate))
+            print("The start date of the status: {}".format(statusDate))
+            print("The end date of the range: {}".format(endDate))
+            if statusDate > startDate and statusDate < endDate:
+                status.setEmitTime(statusDate)
+                statuses.append(status)
+        return statuses
+
+#***********************************************************************************************************************************
+
+class LocalSiteRepoDriver(SiteRepoDriver):
+
+    def _copyFile(self, fromPath, toPath, jobContext):
+        iAmAJob = False
+        if (jobContext is None):
+            iAmAJob = True
+            jobContext = JobContext()
+
+        jstatus = JobStatus(jobContext)
+        if (iAmAJob):
+            # emit the starting job status sequence
+            jstatus.emit(JobStatusValues.PENDING.value)
+            jstatus.emit(JobStatusValues.RUNNING.value)
+
+        jstatus.setNativeInfo(JobStatus.makeRepoInfo(RepoOp.PUT, False, str(fromPath), str(toPath)))
+        jstatus.emit(JobStatusValues.INFO.value)
+
+        try:
+            shutil.copy(fromPath, toPath)
+        except Exception as ex:
+            logging.error("Error copying file: " + str(ex))
+            if iAmAJob:
+                jstatus.emit(JobStatusValues.FAILED.value)
+            return False
+
+        if (iAmAJob):
+            jstatus.emit(JobStatusValues.FINISHING.value)
+            jstatus.emit(JobStatusValues.COMPLETE.value)
+        return True
+
+    # If we're given a context, we use it, if not, we consider ourselves our own job.
+    def put(self, localRef: Path, siteRef: SiteFileRef, jobContext: JobContext = None) -> SiteFileRef:
+        fromPath = localRef
+        toPath = siteRef.getPath()
+        if not self._copyFile(fromPath, toPath, jobContext):
+           return False
+
+        # return success result
+        MetaRepo.notate(siteRef)
+        return FSFileRef.siteFileRefFromPath(toPath + "/" + fromPath.name)
+
+    def get(self, siteRef: SiteFileRef, localRef: Path, jobContext: JobContext = None) -> Path:
+        fromPath = siteRef.getPath()
+        toPath = localRef
+        if not self._copyFile(fromPath, toPath, jobContext):
+           return False
+
+        # return success result
+        return Path(str(toPath) + "/" + Path(fromPath).name)
+
+
+    def find(self, siteRef: SiteFileRef) -> [SiteFileRef]:
+        return MetaRepo.find(siteRef)
+
+
+
+#************************************************************************************************************************************
+
+_repoDriver = LocalSiteRepoDriver()
+
+class LocalSite(Site):
+    # There are no required args to instantiate a local site.
+    def __init__(self):
+        super(LocalSite, self).__init__(SITE_NAME, LocalSiteAuthDriver(), LocalSiteRunDriver(), _repoDriver, None)
+
+
+
+#************************************************************************************************************************************
+
+# test
+if __name__ == '__main__':
+    # assumes the lwfm job status service is running
+    logging.basicConfig()
+    logging.getLogger().setLevel(logging.INFO)
+
+    logging.info("***** login test")
+
+    # on local sites, login is a no-op
+    site = Site.getSiteInstanceFactory("local")
+    logging.info("site is " + site.getName())
+    site.getAuthDriver().login()
+    logging.info("auth is current = " + str(site.getAuthDriver().isAuthCurrent()))
+
+    logging.info("***** local job test")
+
+    # run a local 'pwd' as a job
+    jdefn = JobDefn()
+    jdefn.setEntryPoint("echo")
+    jdefn.setJobArgs([ "pwd = `pwd`" ])
+    status = site.getRunDriver().submitJob(jdefn)
+    logging.info("pwd job id = " + status.getJobContext().getId())
+    logging.info("pwd job status = " + str(status.getStatus()))   # initial status will be pending - its async
+
+    logging.info("***** repo tests")
+
+    # ls a file
+    fileRef = FSFileRef()
+    fileRef.setPath(os.path.realpath(__file__))
+    logging.info("name of the file is " + site.getRepoDriver().find(fileRef).getName())
+    logging.info("size of the file is " + str(site.getRepoDriver().find(fileRef).getSize()))
+
+    # ls a directory
+    fileRef.setPath(os.path.expanduser('~'))
+    fileRef = site.getRepoDriver().find(fileRef)
+    logging.info("size of the dir is " + str(fileRef.getSize()))
+    logging.info("time of the dir is " + str(fileRef.getTimestamp()))
+    logging.info("contents of the dir is " + str(fileRef.getDirContents()))
+
+    # put - run as a brand new job (note: this script itself is *not* a job, its just a script, so the job we
+    # run here is a seminal job
+    localFile = os.path.realpath(__file__)
+    destFileRef = FSFileRef.siteFileRefFromPath(os.path.expanduser('~'))
+    copiedFileRef = site.getRepoDriver().put(Path(localFile), destFileRef)
+    logging.info(copiedFileRef.getName() + " " + str(copiedFileRef.getTimestamp()))
+
+    # get - run as a brand new job, but this time, pre-generate the job context
+    fileRef = FSFileRef.siteFileRefFromPath(os.path.realpath(__file__))
+    destPath = Path(os.path.expanduser('~'))
+    copiedPath = site.getRepoDriver().get(fileRef, destPath, JobContext())
+    logging.info("get test: copied to: " + str(copiedPath))
+
+    logging.info("***** check status of async job")
+
+    # the above job was async... check its status
+    while (True):
+        status = site.getRunDriver().getJobStatus(status.getJobContext())
+        if (status.isTerminal()):             # should have a terminal status by now...
+            logging.info("pwd job status = " + str(status.getStatus()))
+            break
+
+    logging.info("***** cancel job")
+
+    # cancel a job
+    jdefn = JobDefn()
+    jdefn.setEntryPoint("sleep 100")
+    status = site.getRunDriver().submitJob(jdefn)
+    logging.info("sleep job id = " + status.getJobContext().getId())
+    logging.info("sleep job status = " + str(status.getStatus()))   # initial status will be pending - its async
+    # wait a little bit for the job to actually start and emit a running status, then we'll cancel it
+    time.sleep(10)
+    site.getRunDriver().cancelJob(status.getJobContext())
+    while (True):
+        status = site.getRunDriver().getJobStatus(status.getJobContext())
+        if (status.isTerminal()):             # should have a terminal status by now...
+            logging.info("sleep job status = " + str(status.getStatus()))
+            break
+
+    logging.info("testing done")
+
+from abc import ABC, abstractmethod
+import logging
+import uuid
+
+
+# UUID generator used to give jobs lwfm ids which obviates collisions between job sites.  Other objects in the system
+# may also benefit from this generator.
+class _IdGenerator:
+    @staticmethod
+    def generateId():
+        return str(uuid.uuid4())
+
+
+# Many base classes extend LwfmBase to permit the passing of arbitrary name=value maps in addition to the fixed parameters
+# specified by various classes in the object model.
+class LwfmBase(ABC):
+
+    args: dict = None    # most class attributes backed by getters and setters are handled as values in this dict
+
+    def __init__(self, args: dict):
+        if (args is None):
+            args = {}
+        self.setArgs(args)
+
+    def _setArg(self, name: str, value: type) -> None:
+        self.args[name] = value
+
+    def _getArg(self, name: str) -> type:
+        return self.args.get(name, None)
+
+    def getArgs(self) -> dict:
+        return self.args
+
+    def setArgs(self, args: dict):
+        if args is None:
+            args = dict()
+        self.args = dict(args)
+
+
+#************************************************************************************************************************************
+
+# test
+if __name__ == '__main__':
+    logging.basicConfig()
+    logging.getLogger().setLevel(logging.DEBUG)
+    base = LwfmBase()
+    base._setArg("foo", "bar")
+    logging.info(base._getArg("foo"))
+import requests
+
+
+# This communicates with a MetaRepo2 API. The user will have to set the domain
+# first, at which point notate and find will remain available. If the user has NOT
+# set the domain, no errors are issued, because this is a valid state. You may not
+# want to be using an external Metarepo in a particular workflow
+
+_domain = None
+
+class MetaRepo:
+    # We put everything in classes because ???
+
+    @staticmethod
+    def setDomain(domain):
+        # Before we can set a file, we need to pick a domain
+        global _domain
+        _domain = domain
+        
+    @staticmethod
+    def getDomain():
+        global _domain
+        return _domain
+
+    @staticmethod
+    def notate(fileRef, siteClass=None, siteMetadata=None, targetClass=None, targetMetadata=None, token=None):
+        # Given a fileRef, add it to the MetaRepo
+        # The user must supply a site and target information, so Metarepo knows how to
+        # process the metasheet
+        global _domain
+        if _domain is None:
+            return
+        
+        metasheet = {}
+        metasheet["docSetId"] = [] # No concept of set IDs in lwfm for the moment, but should be added
+        metasheet["displayName"] = fileRef.getName()
+        metasheet["userMetadata"] = fileRef.getMetadata()
+
+        metasheet["siteClass"] = siteClass
+        metasheet["siteMetadata"] = siteMetadata
+        
+        metasheet["targetClass"] = targetClass
+        metasheet["targetMetadata"] = targetMetadata
+        
+        r = requests.post(f"http://{_domain}/notate", json=metasheet,
+                         headers={"Authorization": f"Bearer {token}"})
+        if not r.status_code == 200:
+            print(r.text)
+        
+    @staticmethod
+    def find(fileRef):
+        global _domain
+        if _domain is None:
+            return
+
+        fileList = []
+
+        metaRepo = MetaRepo._getMetaRepo()
+        for file in metaRepo:
+            if fileRef.getId() is not None       and file.getId() != fileRef.getId():
+                continue
+            if fileRef.getName() is not None     and file.getName() != fileRef.getName():
+                continue
+            if fileRef.getMetadata() is not None and file.getMetadata() != fileRef.getMetadata():
+                continue
+            fileList.append(file)
+        return fileList
+    
+
+# NerscSiteDriver: an implementation of Site and its constituent Auth, Run, Repo interfaces for the NERSC Superfacility API.
+# This national lab API provides an interface to interact with HPC resources such as Cori and Perlmutter.
+
+from authlib.integrations.requests_client import OAuth2Session
+from authlib.oauth2.rfc7523 import PrivateKeyJWT
+
+import requests
+import json
+import time
+from datetime import datetime, timezone
+from enum import Enum
+from pathlib import Path
+from typing import Callable
+
+import logging
+
+from lwfm.base.Site import Site, SiteAuthDriver, SiteRunDriver, SiteRepoDriver
+from lwfm.base.SiteFileRef import FSFileRef, SiteFileRef, RemoteFSFileRef
+from lwfm.base.JobDefn import JobDefn, RepoOp
+from lwfm.base.JobStatus import JobStatus, JobStatusValues, JobContext
+from lwfm.base.JobEventHandler import JobEventHandler
+from lwfm.base.MetaRepo import MetaRepo
+from lwfm.store.AuthStore import AuthStore
+
+
+class NerscSite(Site):
+    def __init__(self):
+        super(NerscSite, self).__init__("nersc", NerscSiteAuthDriver(), NerscSiteRunDriver(), NerscSiteRepoDriver(), None)
+        self._runDriver.setMachine(None)
+
+class PerlmutterSite(Site):
+    def __init__(self):
+        super(PerlmutterSite, self).__init__("nersc", NerscSiteAuthDriver(), PerlmutterSiteRunDriver(), PerlmutterSiteRepoDriver(),
+                                             None)
+        self._runDriver.setMachine("perlmutter")
+
+class CoriSite(Site):
+    def __init__(self):
+        super(CoriSite, self).__init__("nersc", NerscSiteAuthDriver(), CoriSiteRunDriver(), CoriSiteRepoDriver(), None)
+        self._runDriver.setMachine("cori")
+
+NERSC_BASE_URL = "https://api.nersc.gov/api/v1.2"
+class NERSC_URLS(Enum):
+    NERSC_SUBMIT_URL = NERSC_BASE_URL + "/compute/jobs/"
+    NERSC_STATUS_URL = NERSC_BASE_URL + "/compute/jobs/"
+    NERSC_CANCEL_URL = NERSC_BASE_URL + "/compute/jobs/"
+    NERSC_TASK_URL   = NERSC_BASE_URL + "/tasks/"
+    NERSC_PUT_URL = NERSC_BASE_URL + "/utilities/upload/"
+    NERSC_GET_URL = NERSC_BASE_URL + "/utilities/download/"
+    NERSC_LS_URL  = NERSC_BASE_URL + "/utilities/ls/"
+    NERSC_CMD_URL = NERSC_BASE_URL + "/utilities/command/"
+
+class NerscJobStatus(JobStatus):
+    def __init__(self, jcontext: JobContext = None):
+        super(NerscJobStatus, self).__init__(jcontext)
+        self.getJobContext().setSiteName("nersc")
+        self.setStatusMap({
+            "OK"            : JobStatusValues.PENDING    ,
+            "NEW"           : JobStatusValues.PENDING    ,
+            "PENDING"       : JobStatusValues.PENDING    ,
+            "CONFIGURING"   : JobStatusValues.PENDING    ,
+            "RUNNING"       : JobStatusValues.RUNNING    ,
+            "COMPLETING"    : JobStatusValues.FINISHING  ,
+            "STAGE_OUT"     : JobStatusValues.FINISHING  ,
+            "COMPLETED"     : JobStatusValues.COMPLETE   ,
+            "BOOT_FAIL"     : JobStatusValues.FAILED     ,
+            "FAILED"        : JobStatusValues.FAILED     ,
+            "NODE_FAIL"     : JobStatusValues.FAILED     ,
+            "OUT_OF_MEMORY" : JobStatusValues.FAILED     ,
+            "CANCELLED"     : JobStatusValues.CANCELLED  ,
+            "PREEMPTED"     : JobStatusValues.CANCELLED  ,
+            "SUSPENDED"     : JobStatusValues.CANCELLED  ,
+            "DEADLINE"      : JobStatusValues.CANCELLED  ,
+            "TIMEOUT"       : JobStatusValues.CANCELLED  ,
+            })
+
+
+class NerscSiteAuthDriver(SiteAuthDriver):
+    _authJson: str = None
+    _accessToken: str = None
+    _expiresAt: int = None
+    _session = None
+
+    def login(self, force: bool=False) -> bool:
+        if not force and self.isAuthCurrent():
+            logging.debug("Auth is current - bypassing new login")
+            return True
+
+        # login again
+        authProps = AuthStore().loadAuthProperties("nersc")
+        if authProps is None:
+            logging.error("Error locating 1st-factor of NERSC login info from user home dir")
+            return False
+
+        try:
+            private_key = authProps['private_key'].strip() # In case the user includes a newline in their token
+            session = OAuth2Session(
+                authProps['client_id'],
+                private_key,
+                PrivateKeyJWT(authProps['token_url']),
+                grant_type="client_credentials",
+                token_endpoint=authProps['token_url']
+            )
+            self._authJson = session.fetch_token()
+            self._accessToken = self._authJson['access_token']
+            self._expiresAt = self._authJson['expires_at']
+            self._session = session
+            return True
+        except Exception as ex:
+            logging.error("Error logging into Nersc: {}".format(ex))
+            self._authJson = None
+            self._accessToken = None
+            self._expiresAt = None
+            self._session = None
+            return False
+
+
+    def _isTokenValid(self) -> bool:
+        now = datetime.utcnow().replace(tzinfo= timezone.utc).timestamp()
+        if (self._expiresAt > now):
+            return True
+        else:
+            return False
+
+
+    def isAuthCurrent(self) -> bool:
+        # are we already holding a valid auth token?
+        if (self._accessToken is not None) and (self._isTokenValid()):
+            return True
+        else:
+            return False
+
+
+#***********************************************************************************************************************************
+
+class NerscSiteRunDriver(SiteRunDriver):
+    machine = None
+
+    def _getSession(self):
+        authDriver = NerscSiteAuthDriver()
+        authDriver.login()
+        return authDriver._session
+
+    def setMachine(self, machine):
+        self.machine = machine
+
+    def submitJob(self, jdefn: JobDefn=None, parentContext: JobContext = None) -> JobStatus:
+        # We can (should?) use the compute type from the JobDefn, but we should keep usage consistent with the other methods
+        if self.machine is None:
+            logging.error("No machine found. Please use the setMachine() method before trying to submit a NERSC job.")
+            return False
+
+        # Make sure we have a parent context
+        if (parentContext is None):
+            parentContext = JobContext()
+
+        # Construct our URL
+        url = NERSC_URLS.NERSC_SUBMIT_URL.value + self.machine
+
+        # Submit the job
+        session = self._getSession()
+        data = {"isPath" : True,
+                "job" : jdefn.getEntryPoint()}
+        r = session.post(url, data=data)
+        if not r.status_code == requests.codes.ok:
+            logging.error("Error submitting job")
+            return False
+        task_id = r.json()['task_id']
+
+
+        # Given a task ID, we need to get the job ID
+        # It takes time to process the task, so loop through and check every few seconds until we have a job id
+        status = 'new'
+        while not status == 'completed':
+           task_url = NERSC_URLS.NERSC_TASK_URL.value + task_id
+           r = session.get(task_url)
+           status = r.json()['status']
+           time.sleep(2)
+        j = json.loads(r.json()['result']) # 'result' is a JSON formatted string, so we need to convert again
+        if j['error'] is not None:
+            logging.error("Error submitting job: " + j['error'])
+            return False
+
+        # Construct our status message
+        jstatus = NerscJobStatus(parentContext)
+        jstatus.setNativeStatusStr(j['status'].upper())
+        jstatus.setNativeId(j['jobid'])
+        jstatus.setEmitTime(datetime.utcnow())
+        jstatus.getJobContext().setSiteName(self.machine)
+        return jstatus
+
+    def getJobStatus(self, jobContext: JobContext) -> JobStatus:
+        if self.machine is None:
+            logging.error("No machine found. Please use the setMachine() method before trying to check a NERSC job status.")
+            return False
+
+        # Construct our URL
+        url = NERSC_URLS.NERSC_STATUS_URL.value + self.machine + "/" + jobContext.getNativeId()
+
+        # Check the status
+        session = self._getSession()
+        data = {"sacct" : True} # We can use either sacct or squeue for info, sacct seems to work a fail a bit less often
+        r = session.get(url, data=data)
+        if not r.status_code == requests.codes.ok:
+            logging.error("Error getting job status")
+            return False
+        if not r.json()['output']:
+            logging.error("Job not found.")
+            return False
+        j = r.json()['output'][0]
+
+        # Construct our status message
+        jstatus = NerscJobStatus()
+        jstatus.setNativeStatusStr(j['state'].split(' ')[0]) # Cancelled jobs appear in the form "CANCELLED by user123", so make sure to just grab the beginning
+        jstatus.setNativeId(jobContext.getNativeId())
+        jstatus.setEmitTime(datetime.utcnow())
+        jstatus.getJobContext().setSiteName(self.machine)
+        return jstatus
+
+    def cancelJob(self, jobContext: JobContext) -> bool:
+        if self.machine is None:
+            logging.error("No machine found. Please use the setMachine() method before trying to cancel a NERSC job.")
+            return False
+
+        # Construct our URL
+        url = NERSC_URLS.NERSC_SUBMIT_URL.value + self.machine +"/" + jobContext.getNativeId()
+
+        # Cancel the job
+        session = self._getSession()
+        r = session.delete(url)
+        if not r.status_code == requests.codes.ok:
+            logging.error("Error cancelling job")
+            return False
+        return True
+
+
+    def listComputeTypes(self) -> [str]:
+        raise NotImplementedError()
+
+
+    def setEventHandler(self, jobContext: JobContext, jobStatus: JobStatusValues, statusFilter: Callable,
+                        newJobDefn: JobDefn, newJobContext: JobContext, newSiteName: str) -> JobEventHandler:
+        raise NotImplementedError()
+
+
+    def unsetEventHandler(self, jeh: JobEventHandler) -> bool:
+        raise NotImplementedError()
+
+
+    def listEventHandlers(self) -> [JobEventHandler]:
+        raise NotImplementedError()
+
+    def getJobList(self, startTime: int, endTime: int) -> [JobStatus]:
+        raise NotImplementedError()
+
+
+class PerlmutterSiteRunDriver(NerscSiteRunDriver):
+    machine = 'perlmutter'
+
+class CoriSiteRunDriver(NerscSiteRunDriver):
+    machine = 'cori'
+
+#***********************************************************************************************************************************
+
+class NerscSiteRepoDriver(SiteRepoDriver):
+    machine = None
+
+    def _getSession(self):
+        authDriver = NerscSiteAuthDriver()
+        authDriver.login()
+        return authDriver._session
+
+    def put(self, localRef: Path, siteRef: SiteFileRef, jobContext: JobContext = None) -> SiteFileRef:
+        # Book keeping for status emissions
+        iAmAJob = False
+        if (jobContext is None):
+            iAmAJob = True
+            jobContext = JobContext()
+        jstatus = NerscJobStatus(jobContext)
+        jstatus.getJobContext().setSiteName(self.machine)
+        if (iAmAJob):
+            # emit the starting job status sequence
+            jstatus.emit(JobStatusValues.PENDING.value)
+            jstatus.emit(JobStatusValues.RUNNING.value)
+
+        # Construct our URL
+        remotePath = siteRef.getPath()
+        url = NERSC_URLS.NERSC_PUT_URL.value + self.machine + remotePath
+
+        # Emit our info status before hitting the API
+        jstatus.setNativeInfo(JobStatus.makeRepoInfo(RepoOp.PUT, False, str(localRef), str(remotePath)))
+        jstatus.emit(JobStatusValues.INFO.value)
+
+        # Convert the file into a binary form we can send over
+        with localRef.open('rb') as f:
+            fileBinary = f.read()
+
+        # Make the connection and send the file
+        session = self._getSession()
+        data = {"file" : fileBinary}
+        r = session.put(url, data=data)
+        if not r.status_code == requests.codes.ok:
+            logging.error("Error uploading file")
+            if (iAmAJob):
+                jstatus.emit(JobStatusValues.FAILED.value)
+            return False
+        if (iAmAJob):
+            # emit the successful job ending sequence
+            jstatus.emit(JobStatusValues.FINISHING.value)
+            jstatus.emit(JobStatusValues.COMPLETE.value)
+        MetaRepo.notate(siteRef)
+        return siteRef
+
+    def get(self, siteRef: SiteFileRef, localRef: Path, jobContext: JobContext = None) -> Path:
+        # Book keeping for status emissions
+        iAmAJob = False
+        if (jobContext is None):
+            iAmAJob = True
+            jobContext = JobContext()
+        jstatus = NerscJobStatus(jobContext)
+        jstatus.getJobContext().setSiteName(self.machine)
+        if (iAmAJob):
+            # emit the starting job status sequence
+            jstatus.emit(JobStatusValues.PENDING.value)
+            jstatus.emit(JobStatusValues.RUNNING.value)
+
+        # Construct our URL
+        remotePath = siteRef.getPath()
+        url = NERSC_URLS.NERSC_GET_URL.value + self.machine + remotePath
+
+        # Emit our info status before hitting the API
+        jstatus.setNativeInfo(JobStatus.makeRepoInfo(RepoOp.PUT, False, remotePath, str(localRef)))
+        jstatus.emit(JobStatusValues.INFO.value)
+
+        # Make the connection and grab the file
+        session = self._getSession()
+        r = session.get(url)
+        if not r.status_code == requests.codes.ok:
+            logging.error("Error downloading file")
+            if (iAmAJob):
+                jstatus.emit(JobStatusValues.FAILED.value)
+            return False
+
+        # Now we can write
+        with localRef.open('w', newline='') as f: # Newline argument is needed or else all newlines are doubled
+            f.write(r.json()['file'])
+        if (iAmAJob):
+            # emit the successful job ending sequence
+            jstatus.emit(JobStatusValues.FINISHING.value)
+            jstatus.emit(JobStatusValues.COMPLETE.value)
+        MetaRepo.notate(siteRef)
+        return localRef
+
+    def find(self, siteRef: SiteFileRef) -> [SiteFileRef]:
+        path = siteRef.getPath()
+        url = NERSC_URLS.NERSC_LS_URL.value + self.machine + path
+
+        # Write. Note that we want to pass back the full ls info
+        session = self._getSession()
+        r = session.get(url)
+        if not r.status_code == requests.codes.ok:
+            logging.error("Error performing ls")
+            return False
+
+        # Superfacility returns a json object. The "entries" field is a list of dicts, where each dict
+        # corresponds to a file, with name, size, and other bits of info. We only want the name.
+        fileList = r.json()["entries"]
+        fileList = [f["name"] for f in fileList]
+        remoteRef = FSFileRef()
+        remoteRef.setDirContents(fileList)
+        return [remoteRef]
+
+class PerlmutterSiteRepoDriver(NerscSiteRepoDriver):
+    machine = 'perlmutter'
+
+class CoriSiteRepoDriver(NerscSiteRepoDriver):
+    machine = 'cori'
+
+#***********************************************************************************************************************************
+
+
+
+# Force a login vs Nersc and store the token results.
+if __name__ == '__main__':
+    logging.basicConfig()
+    logging.getLogger().setLevel(logging.INFO)
+    site = Site.getSiteInstanceFactory("nersc")
+    logging.info("Forcing new login to NERSC...")
+    site.getAuthDriver().login(True)
+    logging.info("Is NERSC auth valid: " + str(site.getAuthDriver().isAuthCurrent()))
+
+    # Try run methods
+    jdefn = JobDefn()
+    jdefn.setEntryPoint("/global/homes/a/agallojr/slurm_test.sh")
+    runDriver = NerscSiteRunDriver()
+    runDriver.setMachine("perlmutter")
+    job = runDriver.submitJob(jdefn)
+    runDriver.getJobStatus(job.getNativeId())
+    runDriver.cancelJob(job.getNativeId())
+    runDriver.getJobStatus(job.getNativeId())
+
+    # Try file methods
+    #localRef = Path("C:/lwfm/foo.py")
+    #localRef2 = Path("C:/lwfm/foo2.py")
+    #siteRef = RemoteFSFileRef()
+    #siteRef.setHost("perlmutter")
+    #siteRef.setPath("/global/homes/a/agallojr/tmp.py")
+    #NerscSiteRepoDriver().put(localRef, siteRef)
+    #NerscSiteRepoDriver().get(siteRef, localRef2)
+
+# OrnlSiteDriver: an implementation of Site and its constituent Auth, Run, Repo interfaces for ORNL clusters.
+# Because there is no API, we rely on Paramiko to open an SSH connection
+
+from datetime import datetime
+from pathlib import Path
+from typing import Callable
+
+import getpass
+import paramiko
+import threading
+
+import logging
+
+from lwfm.base.Site import Site, SiteAuthDriver, SiteRunDriver, SiteRepoDriver
+from lwfm.base.SiteFileRef import SiteFileRef
+from lwfm.base.JobDefn import JobDefn, RepoOp
+from lwfm.base.JobStatus import JobStatus, JobStatusValues, JobContext
+from lwfm.base.JobEventHandler import JobEventHandler
+
+
+class OrnlSite(Site):
+    def __init__(self):
+        super(OrnlSite, self).__init__("ornl", OrnlSiteAuthDriver(), OrnlSiteRunDriver(), OrnlSiteRepoDriver(), None)
+
+class SummitSite(Site):
+    def __init__(self):
+        super(SummitSite, self).__init__("summit", SummitSiteAuthDriver(), SummitSiteRunDriver(), OrnlSiteRepoDriver(),
+                                             None)
+
+class OrnlJobStatus(JobStatus):
+    def __init__(self, jcontext: JobContext = None):
+        super(OrnlJobStatus, self).__init__(jcontext)
+        self.setStatusMap({
+            "PEND"  : JobStatusValues.PENDING      ,
+            "RUN"   : JobStatusValues.RUNNING      ,
+            "DONE"  : JobStatusValues.COMPLETE     ,
+            "EXIT"  : JobStatusValues.FAILED       ,
+            "PSUSP" : JobStatusValues.CANCELLED    ,
+            "USUSP" : JobStatusValues.CANCELLED    ,
+            "SSUSP" : JobStatusValues.CANCELLED    ,
+            })
+
+KEEPALIVE_SECONDS = 300 # Send a message to each SSH client every n seconds to keep them alive
+
+def _keepalive(client):
+    # If we stop interacting with the machine, ORNL will eventually automatically close the connection
+    # so periodically just send an empty command to keep it alive 
+    client.exec_command("")
+    threading.Timer(KEEPALIVE_SECONDS, _keepalive, (client,)).start()
+
+class OrnlSiteAuthDriver(SiteAuthDriver):
+    # The parent for different summit machines. To add a new machine, we need to make a child class
+    # with a host identified, and a new class level "client" object 
+    _host = None
+    _client = None
+    
+    @classmethod
+    def _get_client(cls, force=False):
+        if cls._client is None or force:
+            cls._client = paramiko.SSHClient()
+            cls._client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            username = input("ORNL Username: ")
+            password = getpass.getpass(prompt="ORNL Passcode: ")
+            cls._client.connect(cls._host, username=username, password=password)
+            #threading.Timer(KEEPALIVE_SECONDS, _keepalive, (cls._client,)).start()
+        return cls._client
+    
+
+    def login(self, force: bool=False) -> bool:
+        # We need a class method so we can treat the connection for each endpoint as a singleton
+        try:
+            self.__class__._get_client(force)
+            retVal = True
+        except Exception as e:
+            print(f"Could not log in: {e}")
+            retVal = False
+        return retVal
+
+    def isAuthCurrent(self) -> bool:
+        return self._client is not None
+
+class SummitSiteAuthDriver(OrnlSiteAuthDriver):
+    _host = 'summit.olcf.ornl.gov'
+    _client = None # A singleton connection so we don't need to login every time we want to do something
+    
+class _OrnlDtnSiteAuthDriver(OrnlSiteAuthDriver):
+    # DTN is the Data Transfer Node. It is used by ORNL collectively, but ONLY for file transfers.
+    _host = 'dtn.olcf.ornl.gov'
+    _client = None # A singleton connection so we don't need to login every time we want to do something
+
+    
+
+
+#***********************************************************************************************************************************
+
+class OrnlSiteRunDriver(SiteRunDriver):
+    authDriver = None
+    machine = 'ornl'
+
+    def _getSession(self, force=False):
+        self.authDriver.login(force)
+        return self.authDriver._client
+
+    def submitJob(self, jdefn: JobDefn=None, parentContext: JobContext = None) -> JobStatus:
+        # We can (should?) use the compute type from the JobDefn, but we should keep usage consistent with the other methods
+        if self.machine is None:
+            logging.error("No machine found. Please use one of the classes for a specific machine (eg SummitSiteRunDriver).")
+            return False
+
+        # Make sure we have a parent context
+        if (parentContext is None):
+            parentContext = JobContext()
+
+        # Submit the job
+        ssh = self._getSession()
+        bsubFile = jdefn.getEntryPoint()
+        try:
+            ssh_stdin, ssh_stdout, ssh_stderr = ssh.exec_command(f"source /etc/profile; bsub {bsubFile}")
+        except ConnectionResetError: # Our connection had to reset, so let's try to log in again
+            ssh = self._getSession(force=True)
+            ssh_stdin, ssh_stdout, ssh_stderr = ssh.exec_command(f"source /etc/profile; bsub {bsubFile}")
+        except paramiko.ChannelException:
+            ssh = self._getSession(force=True)
+            ssh_stdin, ssh_stdout, ssh_stderr = ssh.exec_command(f"source /etc/profile; bsub {bsubFile}")
+
+            
+        ssh_stdout = ssh_stdout.read().decode() # Read from the stream and convert to a normal string
+        ssh_stderr = ssh_stderr.read().decode()
+
+        # Construct our status message
+        jstatus = OrnlJobStatus(parentContext)
+        if not ssh_stderr:
+            jstatus.setNativeStatusStr("PEND")
+            
+            jobId = ssh_stdout[ssh_stdout.find('<')+1:ssh_stdout.find('>')]
+            jstatus.getJobContext().setNativeId(jobId)
+        else:
+            jstatus.setStatus("EXIT")
+            logging.error(f"Job {bsubFile} failed: {ssh_stderr}")
+        jstatus.setEmitTime(datetime.utcnow())
+        jstatus.getJobContext().setSiteName(self.machine)
+        return jstatus
+
+    def getJobStatus(self, jobContext: JobContext) -> JobStatus:
+        if self.machine is None:
+            logging.error("No machine found. Please use one of the classes for a specific machine (eg SummitSiteRunDriver).")
+            return False
+
+        # Check the status
+        ssh = self._getSession()
+        jobId = jobContext.getNativeId()
+        try:
+            ssh_stdin, ssh_stdout, ssh_stderr = ssh.exec_command("source /etc/profile; bjobs " + jobId + " | tail -n1 | awk '{print $3}'")
+        except ConnectionResetError: # Our connection had to reset, so let's try to log in again
+            ssh = self._getSession(force=True)
+            ssh_stdin, ssh_stdout, ssh_stderr = ssh.exec_command("source /etc/profile; bjobs " + jobId + " | tail -n1 | awk '{print $3}'")
+        except paramiko.ChannelException:
+            ssh = self._getSession(force=True)
+            ssh_stdin, ssh_stdout, ssh_stderr = ssh.exec_command("source /etc/profile; bjobs " + jobId + " | tail -n1 | awk '{print $3}'")
+        status = ssh_stdout.read().decode().strip()
+
+        # Construct our status message
+        jstatus = OrnlJobStatus(jobContext)
+        jstatus.setNativeStatusStr(status) # Cancelled jobs appear in the form "CANCELLED by user123", so make sure to just grab the beginning
+        jstatus.getJobContext().setNativeId(jobId)
+        jstatus.setEmitTime(datetime.utcnow())
+        jstatus.getJobContext().setSiteName(self.machine)
+        return jstatus
+
+    def cancelJob(self, jobContext: JobContext) -> bool:
+        raise NotImplementedError()
+
+
+    def listComputeTypes(self) -> [str]:
+        raise NotImplementedError()
+
+
+    def setEventHandler(self, jobContext: JobContext, jobStatus: JobStatusValues, statusFilter: Callable,
+                        newJobDefn: JobDefn, newJobContext: JobContext, newSiteName: str) -> JobEventHandler:
+        raise NotImplementedError()
+
+
+    def unsetEventHandler(self, jeh: JobEventHandler) -> bool:
+        raise NotImplementedError()
+
+
+    def listEventHandlers(self) -> [JobEventHandler]:
+        raise NotImplementedError()
+
+    def getJobList(self, startTime: int, endTime: int) -> [JobStatus]:
+        raise NotImplementedError()
+
+
+class SummitSiteRunDriver(OrnlSiteRunDriver):
+    authDriver = SummitSiteAuthDriver()
+    machine = 'summit'
+
+
+#***********************************************************************************************************************************
+
+class OrnlSiteRepoDriver(SiteRepoDriver):
+
+    def _getSession(self):
+        client = _OrnlDtnSiteAuthDriver().login()
+        client = _OrnlDtnSiteAuthDriver()._client
+        #scp = paramiko.SFTPClient.from_transport(client.get_transport())
+        return client.open_sftp()
+
+    def put(self, localRef: Path, siteRef: SiteFileRef, jobContext: JobContext = None) -> SiteFileRef:
+        # Book keeping for status emissions
+        iAmAJob = False
+        if (jobContext is None):
+            iAmAJob = True
+            jobContext = JobContext()
+        jobContext.setSiteName("ornl")
+        jstatus = JobStatus(jobContext)
+        if (iAmAJob):
+            # emit the starting job status sequence
+            #jstatus.emit(JobStatusValues.PENDING.value)
+            #jstatus.emit(JobStatusValues.RUNNING.value)
+            pass
+        remotePath = siteRef.getPath()
+
+        # Emit our info status before hitting the API
+        jstatus.setNativeInfo(JobStatus.makeRepoInfo(RepoOp.PUT, False, str(localRef), str(remotePath)))
+        #jstatus.emit(JobStatusValues.INFO.value)
+        
+        # Connect to the DTN, then do a put with paramiko
+        try:
+            sftp = self._getSession()
+            sftp.put(str(localRef), remotePath)
+        except Exception as e:
+            logging.error(f"Error uploading file: {e}")
+            if (iAmAJob):
+                #jstatus.emit(JobStatusValues.FAILED.value)
+                pass
+            return False
+
+        if (iAmAJob):
+            # emit the successful job ending sequence
+            #jstatus.emit(JobStatusValues.FINISHING.value)
+            #jstatus.emit(JobStatusValues.COMPLETE.value)
+            pass
+        #MetaRepo.notate(siteRef)
+        return siteRef
+
+    def get(self, siteRef: SiteFileRef, localRef: Path, jobContext: JobContext = None) -> Path:
+        # Book keeping for status emissions
+        iAmAJob = False
+        if (jobContext is None):
+            iAmAJob = True
+            jobContext = JobContext()
+        jobContext.setSiteName("ornl")
+        jstatus = JobStatus(jobContext)
+        if (iAmAJob):
+            # emit the starting job status sequence
+            #jstatus.emit(JobStatusValues.PENDING.value)
+            #jstatus.emit(JobStatusValues.RUNNING.value)
+            pass
+        remotePath = siteRef.getPath()
+
+        # Emit our info status before hitting the API
+        jstatus.setNativeInfo(JobStatus.makeRepoInfo(RepoOp.PUT, False, remotePath, str(localRef)))
+        #jstatus.emit(JobStatusValues.INFO.value)
+
+        # Connect to the DTN, then do a get with paramiko
+        try:
+            sftp = self._getSession()
+            sftp.get(remotePath, str(localRef))
+        except Exception as e:
+            logging.error(f"Error downloading file: {e}")
+            if (iAmAJob):
+                jstatus.emit(JobStatusValues.FAILED.value)
+            return False
+
+        if (iAmAJob):
+            # emit the successful job ending sequence
+            #jstatus.emit(JobStatusValues.FINISHING.value)
+            #jstatus.emit(JobStatusValues.COMPLETE.value)
+            pass
+        #MetaRepo.notate(siteRef)
+        return localRef
+
+
+    def find(self, siteRef: SiteFileRef) -> [SiteFileRef]:
+        raise NotImplementedError()
+
+
+
+#***********************************************************************************************************************************
+import logging
+import os
+from abc import ABC, abstractmethod
+
+from lwfm.base.JobStatus import JobStatus, JobStatusValues
+import json
+
+#************************************************************************************************************************************
+
+
+class RunStore(ABC):
+    def __init__(self):
+        pass
+
+    @abstractmethod
+    def write(self, datum: type) -> bool:
+        pass
+
+
+#************************************************************************************************************************************
+# We might optionally record locally in a write-once read-never fashion every observed status message.
+
+class RunJobStatusStore(RunStore):
+    def __init__(self):
+        super(RunJobStatusStore, self).__init__()
+
+    def write(self, datum: JobStatus) -> bool:
+        #s = datum.serialize()
+        #file_object = open(os.path.expanduser('~') + '/.lwfm/run_job_status_store.bin', 'ba+')
+        #file_object.write(s)
+        #file_object.close()
+        #s = datum.serialize()
+        file_object = open(os.path.expanduser('~') + '/.lwfm/run_job_status_store.txt', 'a+')
+        file_object.write(datum.toString() + "\n")
+        file_object.close()
+
+
+#************************************************************************************************************************************
+
+# A "job status handler map" is a mapping of a canonical JobStatus state value to any callable handler function which takes a
+# JobStatus arg.  Not all states need be represented with handlers.
+# jobStatusHandlerMap: dict[JobStatusValues, callable]
+
+# Terminal job states will execute the handler function one time. When the job moves to a terminal state, any remaining handlers
+# for that job will be evicted.
+# Non-terminal job states (e.g. INFO states) will execute the handler function once per unique occurance of the state.
+# Only one handler may exist for each state.
+
+# A "job status handler dictionary" is a set of "job status handler maps" indexed by jobId. This allows a O(1) lookup of the handler
+# map for a given job, and O(1) lookup of the specific callable for that job state value.
+
+# Changes to the "job status handler dictionary" should be written to a backing persistence.  Changes include: adding of a new
+# handler map for a specific job, removing a handler map (when the job moves to a terminal state), updating the last instance
+# identifier for a job & job status for non-terminal states (e.g. keeping track of the last and/or every "INFO" seen to notice a
+# unique instance).
+#
+# So our conceptual data structure is: jobStatusHandlerDict: dict[str,dict[JobStatusValues,callable]]
+# Plus the list of distinct JobStatus records (their ids) for non-terminal states which were previously seen and handled.
+# This permits us to not be listening for job status coninuously (e.g. our laptop lid is closed) and then at some point
+# catch up, executing the handlers for state changes not previously seen and handled.
+#
+# Conceptually, the key str to this handler dict could be a wildcard: "handler map for all jobs", "handler map for all jobs for a
+# given site".
+#
+
+class RunEventStore(RunStore):
+    # maintain an in-memory map of event listeners
+
+    def __init__(self):
+        super(RunEventStore, self).__init__()
+
+
+#************************************************************************************************************************************
+
+# Site: Defines an abstract computing location which exposes canonical verbs for the Auth, Run, and Repo (and optionally Spin)
+# logical subsystems. The purpose of lwfm is to permit workflows which span Sites.
+
+
+from enum import Enum
+import logging
+from abc import ABC, abstractmethod
+from typing import Callable
+from pathlib import Path
+import os
+
+
+from lwfm.base.LwfmBase  import LwfmBase
+from lwfm.base.JobStatus import JobStatus, JobStatusValues, JobContext
+from lwfm.base.JobDefn import JobDefn
+from lwfm.base.JobEventHandler import JobEventHandler
+from lwfm.base.SiteFileRef import SiteFileRef
+
+
+#***********************************************************************************************************************************
+
+class SiteAuthDriver(ABC):
+    """
+    Auth: an interface for a Site's user authentication and authorization functiions.  Permits a Site to provide some kind of a
+    "login" be it programmatic or forced interactive.  A given Site's implmentation of Auth might squirrel away some returned
+    token (should the Site use such things).  We can then provide a quicker "is the auth current" method.  We assume the
+    implementation of a Site's Run and Repo subsystems will be provided access under the hood to the necessary implementation
+    details from the Auth system.
+    """
+
+    @abstractmethod
+    def login(self, force: bool=False) -> bool:
+        """
+        Login to the Site using the Site's own mechanism for authenication and caching.
+
+        Params:
+            force - if true, forces a login even if the Site detects that the current login is still viable
+        Returns:
+            bool - true if success, else false
+        """
+        pass
+
+
+    @abstractmethod
+    def isAuthCurrent(self) -> bool:
+        """
+        Is the currently cached Site login info still viable?
+
+        Returns:
+            bool - true if the login is still viable, else false; the Site might not cache, and thus always return false
+        """
+        pass
+
+
+
+#************************************************************************************************************************************
+
+class SiteRunDriver(ABC):
+    """
+    Run: in its most basic "MVP-0" form, the Run subsystem provides a mechanism to submit a job, cancel the job, and interrogate
+    the job's status.  The submitting of a job might, for some Sites, involve a batch scheduler.  Or, for some Sites (like a "local"
+    Site), the run might be immediate.  On submit, the method returns a JobStatus, which for immediate execution might be a terminal
+    completion status.  A job definition (JobDefn) is a description of the job.  Its the role of the Site's Run subsystem to
+    interpret the abstract JobDefn in the context of that Site.  Thus the JobDefn permits arbitrary name=value pairs which might be
+    necessary to submit a job at that Site.  The JobStatus returned is canonical - the Site's own status name set is mapped into the
+    lwfm canonical name set by the implementation of the Site itself.
+    """
+
+    @classmethod
+    def _submitJob(cls, jdefn, jobContext = None):
+        # This helper function, not a member of the public interface, lets Python threading instantiate a
+        # SiteRunDriver of the correct subtype on demand
+        runDriver = cls()
+        runDriver.submitJob(jdefn, jobContext)
+
+
+    @abstractmethod
+    def submitJob(self, jobDefn: JobDefn, parentContext: JobContext = None) -> JobStatus:
+        """
+        Submit the job for execution on this Site.  It is an implementation detail of the Site what that means - everything
+        from pseudo-immediate command line execution, to scheduling on an HPC system.  The caller should assume the run is
+        asynchronous.  We would assume all Sites would implement this method.  Note that "compute type" is an optional member
+        of JobDefn, and might be used by the Site to direct the execution of the job.
+
+        [We note that both the JobDefn and the JobContext potentially contain a reference to a compute type.  Since the Job Context
+        is historical, and provided to give that historical context to the job we're about to run, its strongly suggested that
+        Site.Run implementations use the compute type named in the JobDef, if the concept is present at all on the Site.  We note also
+        that compute type and Site are relatively interchangeable - one can model a compute resource as a compute type, or as its
+        own Site, perhaps with a complete inherited Site driver imp]ementation.  e.g. NerscSiteDriver has two trivially subclassed
+        Sites - one for Cori (rest in peace) and one for Perlmutter.  This could have been impleted as one Site with two compute
+        types.  The Site driver author is invited to use whichever model fits them best.]
+
+        Params:
+            jobDefn - the definition of the job to run, might include the name of a script, include arguments for the run, etc.
+            parentContext - information about the current JobContext which might be running, thus the job we are submitting will be
+                a child in the digital thread; this is an optional argument - if none, the submitted job is considered semminal
+        Returns:
+            JobStatus - preliminary status, containing a JobContext including the Site-specific native job id
+        """
+        pass
+
+
+    @abstractmethod
+    def getJobStatus(self, jobContext: JobContext) -> JobStatus:
+        """
+        Check the status of a job running on this Site.  The Site might raise a NotImplementedError if it does not implement
+        such a check, though this would be unusual.
+
+        Params:
+            jobContext - the context of the executing job, including the native job id
+        Returns:
+            JobStatus - the current known status of the job
+        """
+        pass
+
+
+    @abstractmethod
+    def cancelJob(self, jobContext: JobContext) -> bool:
+        """
+        Cancel the job, which might be in a queued, state, or might already be running.  Its up to to the Site how to
+        handle the cancel, including raising a NotImplementedError.
+
+        Params:
+            jobContext - the context of the job, including the Site-native job id
+        Returns:
+            bool - true if a successful cancel, else false, or throw exception; callers should invoke the getJobStatus() method
+                to obtain final status (e.g., the job might have completed successfully prior to the cancel being receieved, etc.)
+        """
+        pass
+
+
+    @abstractmethod
+    def listComputeTypes(self) -> [str]:
+        """
+        List the compute types supported by the Site.  The Site might not have any concept, and thus might raise a
+        NotImplementedError, or return an empty list, or a list of one singular type of the Site.  Or, the Site might front
+        a number of resources, and return a list of names.
+
+        Returns:
+            [str] - a list of names, potentially empty or None, or a raise of NotImplementedError
+        """
+        pass
+
+
+    @abstractmethod
+    def setEventHandler(self, jdef:JobDefn, jeh: JobEventHandler) -> JobEventHandler:
+
+                        #jobContext: JobContext, jobStatus: JobStatusValues, statusFilter: Callable,
+                        #newJobDefn: JobDefn, newJobContext: JobContext, newSiteName: str) -> JobEventHandler:
+        """
+        Set a job to be submitted when a prior job event occurs.
+        A Site does not need to have a concept of these event handlers (most won't) and is free to throw a NotImplementedError.
+        The local lwfm site will provide an implementation through its own Site.Run interface, and thus permit
+        cross-Site workflow job chaining.
+        Asking a Site to run a job on a Site other than itself (siteName = None) is free to raise a NotImplementedError, though
+        it might be possible in some cases, and the lwfm Local site will permit it.
+
+        Params:
+            jobContext - information about the job we're waiting on including the native Site job id
+            jobStatus - the status string, from the enum set of canonical strings, on which we're waiting
+            statusFilter - a function which returns boolean success / failure after parsing the content of the status message in detail
+            newJobDefn - the job to be submitted to this Site if the handler fires
+            newJobContext - the job context to run the job under, if not provided, reverts to the triggering job being the parent
+            newSiteName - run the job on the named site - this can be None to run on self
+        Returns:
+            JobEventHandler
+        """
+        pass
+
+
+    @abstractmethod
+    def unsetEventHandler(self, jeh: JobEventHandler) -> bool:
+        """
+        Unset an event handler.
+
+        Params:
+            JobEventHandler - a previously set handler
+        Returns:
+            bool - success, fail, or raise NotImplementedError if the Site has no concept of event handlers
+        """
+        pass
+
+
+    @abstractmethod
+    def listEventHandlers(self) -> [JobEventHandler]:
+        """
+        List the JobEventHandler registrations the Site is holding, or an empty list, or raise NotImplementedError if the
+        Site doesn't support event handlers.
+        """
+        pass
+    
+    @abstractmethod
+    def getJobList(self, startTime: int, endTime: int) -> [JobStatus]:
+        """
+        Get a list of jobs between two timestamps.
+        
+        Params:
+            int - a timestamp in the Unix epoch, the beginning of the returned period
+            int - a timestamp in the Unix epoch, the end of the returned period
+        Returns:
+            [JobStatus] - a list of jobs between the two timestamps
+        """
+        pass
+
+
+#***********************************************************************************************************************************
+
+class SiteRepoDriver(ABC):
+    """
+    Repo: Pemmits the movement of data objects to/from the Site.  The methods require a local file reference, and a reference to the
+    remote file - a SiteFileRef.  The SiteFileRef permits arbitrary name=value pairs because the Site might require them to
+    complete the transaction.
+    """
+
+    @abstractmethod
+    def put(self, localPath: Path, siteFileRef: SiteFileRef, jobContext: JobContext = None) -> SiteFileRef:
+        """
+        Take the local file by path and put it to the remote Site.  This might be implemented by the Site as a simple
+        filesystem copy, or it might be a checkin to a managed service - that's up to the Site.  If we're given a context,
+        we use it, if not, we consider ourselves our own job.
+
+        Params:
+            localPath - a local file object
+            siteFileRef - a reference to an abstract "file" entity on the Site - this is the target of the put operation
+            jobContext - if we have a job context we wish to use (e.g. we are already inside a job and wish to indicate the
+                digital thread parent-child relationships) then pass the context in, else the put operation will be performed
+                as its own seminal job
+        Returns:
+            SiteFileRef - a refernce to the entity put on the Site; the Site might also raise any kind of exception depending on
+                the error case
+        """
+        pass
+
+
+    @abstractmethod
+    def get(self, siteFileRef: SiteFileRef, localPath: Path, jobContext: JobContext = None) -> Path:
+        """
+        Get the file from the remote site and write it local, returning a path to the local.
+        If we're given a context, we use it, if not, we consider ourselves our own job.
+
+        Params:
+            siteFileRef - a reference to a data entity on the Site, the source of the get
+            localPath - a local file object, the destination of the get
+            jobContext - if we have a job context we wish to use (e.g. we are already inside a job and wish to indicate the
+                digital thread parent-child relationships) then pass the context in, else the put operation will be performed
+                as its own seminal job
+        Returns:
+            Path - the reference to the local location of the gotten file; during the get, the Site might also raise any kind of
+                exception depending on the error case
+        """
+        pass
+
+
+    @abstractmethod
+    def find(self, siteFileRef: SiteFileRef) -> [SiteFileRef]:
+        """
+        Get info about the file/dir on the remote site
+
+        Params:
+            siteFileRef - a reference to an abstract "file" entity on the Site, may be specialized partially (e.g. wildcards) though
+                it is up to the Site to determine how to implement this search
+        Returns:
+            [SiteFileRef] - the instantiated file reference(s) (not the file, but the references), including the size, timestamp
+                info, and other arbitrary metadata; may be a single file reference, or a list, or none
+        """
+        pass
+
+
+#************************************************************************************************************************************
+# Spin: vaporware.  In theory some Sites would expose mechanisms to create (provision) and destroy various kinds of computing
+# devices.  These might be single nodes, or entire turnkey cloud-bases HPC systems.  Spin operations are modeled as jobs in
+# order to permit sequential workflows which spin up resources, send them jobs, and then spin them down as part of an
+# autonomous operation.  Basic verbs include: show cafeteria, spin up, spin down.  Spins would be wrapped as Jobs allowing normal
+# status interogation.
+
+
+#***********************************************************************************************************************************
+# Site: the Site is simply a name and the getters and setters for its Auth, Run, Repo subsystems.
+#
+# The Site factory utility method returns the Python class which implements the interfaces for the named Site.
+# ~/.lwfm/sites.txt can be used to augment the list of sites provided here with a user's own custom Site implementations.
+# In the event of a name collision between the user's sites.txt and those hardcoded here, the user's sites.txt config trumps.
+
+
+# LwfmBase field list
+class _SiteFields(Enum):
+    SITE_NAME = "siteName"
+
+
+class Site(LwfmBase):
+
+    _authDriver: SiteAuthDriver = None
+    _runDriver:  SiteRunDriver  = None
+    _repoDriver: SiteRepoDriver = None
+
+    # pre-defined Sites and their associated driver implementations, each which implements Auth, Run, Repo, [Spin]
+    # these mappings can be extended in the ~/.lwfm/sites.txt configuration
+    _SITES = {
+        "local":      "lwfm.drivers.LocalSiteDriver.LocalSite",
+        "nersc":      "lwfm.drivers.NerscSiteDriver.NerscSite",
+        "cori":       "lwfm.drivers.NerscSiteDriver.CoriSite",
+        "perlmutter": "lwfm.drivers.NerscSiteDriver.PerlmutterSite",
+        "dt4d":       "lwfm.drivers.DT4DSiteDriver.DT4DSite",
+    }
+
+    @staticmethod
+    def _getSiteEntry(site: str):
+        siteSet = Site._SITES
+        # is there a local site config?
+        path = os.path.expanduser('~') + "/.lwfm/sites.txt"
+        # Check whether the specified path exists or not
+        if os.path.exists(path):
+            logging.info("Loading custom site configs from ~/.lwfm/sites.txt")
+            with open(path) as f:
+                for line in f:
+                    name, var = line.split("=")
+                    name = name.strip()
+                    var = var.strip()
+                    logging.info("Registering driver " + var + " for site " + name)
+                    siteSet[name] = var
+        else:
+            logging.info("No custom ~/.lwfm/sites.txt - using built-in site configs")
+        fullPath = siteSet[site]
+        logging.info("Obtaining driver " + fullPath + " for site " + site)
+        if fullPath is not None:
+            # parse the path into package and class parts for convenience
+            xpackage = fullPath.rsplit('.', 1)[0]
+            xclass = fullPath.rsplit('.', 1)[1]
+            return [ xpackage, xclass ]
+        else:
+            return None
+
+    @staticmethod
+    def getSiteInstanceFactory(site: str = "local"):
+        try:
+            entry = Site._getSiteEntry(site)
+            logging.info("Processing site config entry " + str(entry))
+            import importlib
+            module = importlib.import_module(entry[0])
+            class_ = getattr(module, str(entry[1]))
+            inst = class_()
+            inst.setName(site)
+            return inst
+        except Exception as ex:
+            logging.error("Cannot instantiate Site for " + str(site) + " {}".format(ex))
+
+
+    def __init__(self, name: str, authDriver: SiteAuthDriver, runDriver: SiteRunDriver, repoDriver: SiteRepoDriver, args: dict=None):
+        super(Site, self).__init__(args)
+        self.setName(name)
+        self.setAuthDriver(authDriver)
+        self.setRunDriver(runDriver)
+        self.setRepoDriver(repoDriver)
+
+    def setName(self, name: str) -> None:
+        LwfmBase._setArg(self, _SiteFields.SITE_NAME.value, name)
+
+    def getName(self) -> str:
+        return LwfmBase._getArg(self, _SiteFields.SITE_NAME.value)
+
+    def setAuthDriver(self, authDriver: SiteAuthDriver) -> None:
+        self._authDriver = authDriver
+
+    def getAuthDriver(self) -> SiteAuthDriver:
+        return self._authDriver
+
+    def setRunDriver(self, runDriver: SiteRunDriver) -> None:
+        self._runDriver = runDriver
+
+    def getRunDriver(self) -> SiteRunDriver:
+        return self._runDriver
+
+    def setRepoDriver(self, repoDriver: SiteRepoDriver) -> None:
+        self._repoDriver = repoDriver
+
+    def getRepoDriver(self) -> SiteRepoDriver:
+        return self._repoDriver
+
+
+#***********************************************************************************************************************************
+
+# test
+if __name__ == '__main__':
+    logging.basicConfig()
+    logging.getLogger().setLevel(logging.DEBUG)
+    siteFoo = Site.getSiteInstanceFactory("local")
+    logging.info(siteFoo.getName())
+
+# SiteFileRef: an abstract representation of a data object (a "file") on a Site.  The Site's Repo subsystem might back that
+# with a normal filesystem, or it might back it with something fancier like an object store.  Its the role of the Site's Repo
+# subsystem to interpret the SiteFileRef in its own implementation-detail terms.
+
+
+from abc import ABC, abstractmethod
+from datetime import datetime
+from enum import Enum
+import os
+
+from lwfm.base.LwfmBase import LwfmBase
+
+
+#************************************************************************************************************************************
+
+# A reference to a file object on the site, not the file object itself.
+# This might be a filesystem on a remote machine, or some other kind of managed repo.
+
+class _SiteFileRefFields(Enum):
+    ID        = "id"       # sometimes the data entity has an id distinct from its name
+    NAME      = "filename"
+    SIZE      = "size"
+    TIMESTAMP = "timestamp"
+    IS_FILE   = "isFile"
+    METADATA  = "metadata"
+
+class SiteFileRef(LwfmBase):
+    def __init__(self):
+        super(SiteFileRef, self).__init__(None)
+
+    # some files have identifiers other than a name, some might just return the name
+    def getId(self) -> str:
+        return LwfmBase._getArg(self, _SiteFileRefFields.ID.value)
+
+    def setId(self, id: str) -> None:
+        LwfmBase._setArg(self, _SiteFileRefFields.ID.value, id)
+
+    def getName(self) -> str:
+        return LwfmBase._getArg(self, _SiteFileRefFields.NAME.value)
+
+    def setName(self, name: str) -> None:
+        LwfmBase._setArg(self, _SiteFileRefFields.NAME.value, name)
+
+    def getSize(self) -> int:
+        return LwfmBase._getArg(self, _SiteFileRefFields.SIZE.value)
+
+    def setSize(self, size: int) -> None:
+        LwfmBase._setArg(self, _SiteFileRefFields.SIZE.value, size)
+
+    def getTimestamp(self) -> datetime:
+        return LwfmBase._getArg(self, _SiteFileRefFields.TIMESTAMP.value)
+
+    def setTimestamp(self, tstamp: datetime) -> None:
+        LwfmBase._setArg(self, _SiteFileRefFields.TIMESTAMP.value, tstamp)
+
+    def getMetadata(self) -> dict:
+        return LwfmBase._getArg(self, _SiteFileRefFields.METADATA.value)
+
+    def setMetadata(self, metadata: dict) -> None:
+        LwfmBase._setArg(self, _SiteFileRefFields.METADATA.value, metadata)
+
+
+    # path can mean many things... file system path, with or without host prefix, a link to some "repo", just the id,
+    # a metadata tuple, etc.
+    @abstractmethod
+    def getPath(self) -> str:
+        pass
+
+    @abstractmethod
+    def setPath(self, path: str) -> None:
+        pass
+
+    def isFile(self) -> bool:
+        return LwfmBase._getArg(self, _SiteFileRefFields.IS_FILE.value)
+
+    def setIsFile(self, isFile: bool) -> None:
+        LwfmBase._setArg(self, _SiteFileRefFields.IS_FILE.value, isFile)
+
+
+#************************************************************************************************************************************
+# file on a filesystem
+
+class _FSFileRefFields(Enum):
+    PATH          = "path"
+    DIR_CONTENTS  = "dirContents"   # if a directory, the list of files within
+
+
+class FSFileRef(SiteFileRef):
+    #def getId(self) -> str:
+    #    return self.getName()
+
+    #def setId(self, id: str) -> None:
+    #    self.setName(id)
+
+    def getPath(self) -> str:
+        return LwfmBase._getArg(self, _FSFileRefFields.PATH.value)
+
+    def setPath(self, path: str) -> None:
+        LwfmBase._setArg(self, _FSFileRefFields.PATH.value, path)
+
+    def getDirContents(self) -> [str]:
+        if (self.isFile()):
+            return self.getName()
+        else:
+            return LwfmBase._getArg(self, _FSFileRefFields.DIR_CONTENTS.value)
+
+    def setDirContents(self, contents: [str]) -> None:
+        LwfmBase._setArg(self, _FSFileRefFields.DIR_CONTENTS.value, contents)
+
+    @staticmethod
+    def siteFileRefFromPath(path: str) -> SiteFileRef:
+        fileRef = FSFileRef()
+        fileRef.setId(path)
+        fileRef.setName(path)
+        fileRef.setPath(path)
+        # TODO - messes up serialization
+        #fileRef.setTimestamp(datetime.fromtimestamp(os.path.getmtime(path)))
+        if (os.path.isfile(path)):
+            fileRef.setIsFile(True)
+            fileRef.setSize(os.path.getsize(path))
+        else:
+            fileRef.setIsFile(False)
+            files = os.listdir(path)
+            fileRef.setDirContents(files)
+            fileRef.setSize(len(files))
+        return fileRef
+
+
+#************************************************************************************************************************************
+# file on a remote filesystem
+
+class _RemoteFSFileRefFields(Enum):
+    HOST      = "host"
+
+
+class RemoteFSFileRef(FSFileRef):
+    def getHost(self) -> str:
+        return LwfmBase._getArg(self, _RemoteFSFileRefFields.HOST.value)
+
+    def setHost(self, host: str) -> None:
+        LwfmBase._setArg(self, _RemoteFSFileRefFields.HOST.value, host)
+
+
+#************************************************************************************************************************************
+
+#************************************************************************************************************************************
+# file in an s3 bucket
+
+class S3FileRef(SiteFileRef):
+
+    def getPath(self) -> str:
+        raise NotImplementedError()
+
+    def setPath(self, path: str) -> None:
+        raise NotImplementedError()
+

@@ -1,0 +1,81 @@
+what is lwfm
+LWFM stands for Lightweight Workflow Manager. It is a system that allows users to create and manage workflows that span multiple computing locations or sites. LWFM provides a set of canonical verbs for authentication, running jobs, and managing repositories. It also allows for the customization of sites through configuration files. LWFM is designed to be lightweight and flexible, allowing users to easily define and execute workflows across different computing environments.
+can you provide an lwfm example of using the local site driver to download a file to C:\Users\gr80mcbr\walled_garden and then runs a job that does an echo of the file's contents?
+To download a file to a specific directory using LWFM, you can use the `get` method of the repository driver. Here is an example code snippet:
+# Set up the file reference for the file you want to download
+fileRef = FSFileRef.siteFileRefFromPath("<path_to_file>")
+destPath = Path("<destination_directory>")
+copiedPath = site.getRepoDriver().get(fileRef, destPath, JobContext())
+
+# Print the path where the file was downloaded to
+logging.info("File downloaded to: " + str(copiedPath))
+
+After downloading the file, you can run a job that echoes the file's contents using the LWFM's run driver. Here is an example code snippet:
+
+# Set up the job definition
+jdefn = JobDefn()
+jdefn.setEntryPoint("echo")
+jdefn.setJobArgs(["File contents: `cat " + str(copiedPath) + "`"])
+
+# Submit the job
+status = site.getRunDriver().submitJob(jdefn)
+
+# Print the job ID
+logging.info("Job ID: " + status.getJobContext().getId())
+
+This will run a job that echoes the contents of the downloaded file. Replace <path_to_file> with the actual path of the file you want to download, and <destination_directory> with the directory where you want to save the file.
+
+can you provide a full lwfm script using the local site driver to download a file to C:\Users\gr80mcbr\walled_garden and then runs a job that does 'echo hello world'?
+To create a LWFM script using the local site driver to download a file to C:\Users\gr80mcbr\walled_garden and then run a job that echoes 'hello world', you can follow these steps:
+Import the necessary modules:
+import os
+from lwfm.base.Site import Site
+from lwfm.base.SiteAuthDriver import SiteAuthDriver
+from lwfm.base.SiteRunDriver import SiteRunDriver
+from lwfm.base.SiteRepoDriver import SiteRepoDriver
+from lwfm.base.JobDefn import JobDefn
+
+Define the path of the file you want to download and the destination path where you want to save it:
+file_path = "path/to/file"
+dest_path = "C:\\Users\\gr80mcbr\\walled_garden"
+
+Instantiate the local site:
+site = Site("local", SiteAuthDriver(), SiteRunDriver(), SiteRepoDriver())
+
+Log in to the site:
+site.getAuthDriver().login()
+
+Download the file to the destination path:
+site.getRepoDriver().get(file_path, dest_path)
+
+Define the job that echoes 'hello world':
+jdefn = JobDefn()
+jdefn.setName("HelloWorld")
+jdefn.setEntryPointPath(["/bin/echo", "hello world"])
+
+Submit the job:
+site.getRunDriver().submitJob(jdefn)
+
+Here's the complete script:
+
+import os
+from lwfm.base.Site import Site
+from lwfm.base.SiteAuthDriver import SiteAuthDriver
+from lwfm.base.SiteRunDriver import SiteRunDriver
+from lwfm.base.SiteRepoDriver import SiteRepoDriver
+from lwfm.base.JobDefn import JobDefn
+
+file_path = "path/to/file"
+dest_path = "C:\\Users\\gr80mcbr\\walled_garden"
+
+site = Site("local", SiteAuthDriver(), SiteRunDriver(), SiteRepoDriver())
+site.getAuthDriver().login()
+site.getRepoDriver().get(file_path, dest_path)
+
+jdefn = JobDefn()
+jdefn.setName("HelloWorld")
+jdefn.setEntryPointPath(["/bin/echo", "hello world"])
+
+site.getRunDriver().submitJob(jdefn)
+
+Please note that you need to replace "path/to/file" with the actual path of the file you want to download.
