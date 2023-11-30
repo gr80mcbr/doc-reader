@@ -1,4 +1,6 @@
 import streamlit as st
+import requests
+import os
 from dotenv import load_dotenv
 from langchain.text_splitter import CharacterTextSplitter
 from langchain.embeddings import HuggingFaceInstructEmbeddings
@@ -6,9 +8,19 @@ from langchain.vectorstores import FAISS
 from langchain.memory import ConversationBufferMemory
 from langchain.chains import ConversationalRetrievalChain
 from langchain.chat_models import ChatOpenAI
+from langchain.embeddings.openai import OpenAIEmbeddings
+from langchain.vectorstores import FAISS
+from langchain.vectorstores import Qdrant
+import qdrant_client
 from htmlTemplates import css, bot_template, user_template
+import socket
 
 def main():
+	os.environ['QDRANT_HOST'] = "https://c4ed2810-910d-43b1-b56b-1608322b4946.us-east4-0.gcp.cloud.qdrant.io"
+	os.environ['QDRANT_API_KEY'] = "YaoF52D5ZqOd5OSkwTO08Rr4ToRlXIRlIUCZL_tLYBtao96eR6o8fQ"
+
+	os.environ["COLLECTION_NAME"] = "lwfm"
+
 	load_dotenv()
 	st.set_page_config(page_title="Chat with multiple docs", page_icon=":books:")
 
@@ -40,11 +52,11 @@ def main():
 
 
 def get_doc_text(docs):
-    combined_text = ""
-    for file in docs:
-        file_text = file.read()
-        combined_text += file_text.decode('utf-8')
-    return combined_text
+	combined_text = ""
+	for file in docs:
+		file_text = file.read()
+		combined_text += file_text.decode('utf-8')
+	return combined_text
 
 def get_text_chunks(text):
 	text_splitter = CharacterTextSplitter(
@@ -56,9 +68,22 @@ def get_text_chunks(text):
 	chunks = text_splitter.split_text(text)
 	return chunks
 
-def get_vectorstore(text_chunks):
+def get_local_vectorstore(text_chunks):
 	embeddings = HuggingFaceInstructEmbeddings(model_name="hkunlp/instructor-xl")
 	vectorstore = FAISS.from_texts(texts=text_chunks, embedding=embeddings)
+	return vectorstore
+
+def get_vectorstore(text_chunks):
+	embeddings = OpenAIEmbeddings()
+	print("**********HOST: " + os.getenv("QDRANT_HOST"))
+	client = qdrant_client.QdrantClient(os.getenv("QDRANT_HOST"), os.getenv("QDRANT_API_KEY"))
+	vectorstore = Qdrant(
+		client=client,
+		collection_name=os.getenv("COLLECTION_NAME"),
+		embeddings=embeddings
+	)
+	#vectorstore = FAISS.from_texts(texts=text_chunks, embedding=embeddings)
+	vectorstore.add_texts(text_chunks)
 	return vectorstore
 
 def get_conversation_chain(vectorstore):
@@ -89,3 +114,4 @@ if __name__ == '__main__':
 	if "chat_history" not in st.session_state:
 		st.session_state.chat_history = None
 	main()
+	
