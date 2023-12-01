@@ -16,11 +16,6 @@ from htmlTemplates import css, bot_template, user_template
 import socket
 
 def main():
-	os.environ['QDRANT_HOST'] = "https://c4ed2810-910d-43b1-b56b-1608322b4946.us-east4-0.gcp.cloud.qdrant.io"
-	os.environ['QDRANT_API_KEY'] = "YaoF52D5ZqOd5OSkwTO08Rr4ToRlXIRlIUCZL_tLYBtao96eR6o8fQ"
-
-	os.environ["COLLECTION_NAME"] = "lwfm"
-
 	load_dotenv()
 	st.set_page_config(page_title="Chat with multiple docs", page_icon=":books:")
 
