@@ -9,17 +9,9 @@ css='''
 .chat-message.bot{
 	background-color: #475063
 }
-.chat-message .avatar {
-	width: 15%;
-}
-.chat-message .avatar img {
-	max-width: 78px;
-	max-height: 78px;
-	border-radius: 50%;
-	object-fit: cover;
-}
+
 .chat-message .message {
-	width: 85%;
+	width: 100%;
 	padding: 0 1.5rem;
 	color: #fff;
 }
